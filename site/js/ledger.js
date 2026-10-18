@@ -4,15 +4,20 @@ import { h, $, toast, errMsg, today, withBusy } from './ui.js';
 
 let state = null; // { token, name, members, entries }
 
-export async function renderLedger(root, token) {
-  root.replaceChildren(h('section', { class: 'card empty' }, h('p', {}, '加载中…')));
+// quiet=true：操作后刷新时保留当前内容，避免云端请求期间页面闪成"加载中"
+export async function renderLedger(root, token, { quiet = false } = {}) {
+  if (!quiet) root.replaceChildren(h('section', { class: 'card empty' }, h('p', {}, '加载中…')));
+  else root.setAttribute('aria-busy', 'true');
   try {
     const data = await store.getLedger(token);
     state = { token, ...data };
     rememberLedger(token, data.name);
     paint(root);
+    root.removeAttribute('aria-busy');
   } catch (e) {
     console.error('[load]', e);
+    root.removeAttribute('aria-busy');
+    if (quiet) { toast(errMsg(e), true); return; }
     root.replaceChildren(h('section', { class: 'card empty' },
       h('h2', {}, '打不开这个账本'), h('p', {}, errMsg(e)),
       h('div', { class: 'actions' },
@@ -98,7 +103,7 @@ async function markRepaid(root, btn, t) {
         payerId: t.from, participantIds: [t.to], spentOn: today(),
       });
       toast('已记录还款');
-      await renderLedger(root, state.token);
+      await renderLedger(root, state.token, { quiet: true });
     } catch (e) { toast(errMsg(e), true); }
   });
 }
@@ -109,7 +114,7 @@ async function removeEntry(root, btn, e) {
     try {
       await store.deleteEntry(state.token, e.id);
       toast('已删除');
-      await renderLedger(root, state.token);
+      await renderLedger(root, state.token, { quiet: true });
     } catch (err) { toast(errMsg(err), true); }
   });
 }
@@ -159,7 +164,7 @@ form.addEventListener('submit', (ev) => {
       await store.addEntry(state.token, { kind: 'expense', title, amount, payerId, participantIds, spentOn });
       dialog.close();
       toast(`已记录 ${formatCents(amount)}`);
-      await renderLedger(currentRoot, state.token);
+      await renderLedger(currentRoot, state.token, { quiet: true });
     } catch (e) { errEl.textContent = errMsg(e); }
   });
 });
