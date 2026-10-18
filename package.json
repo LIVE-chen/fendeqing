@@ -1,0 +1,9 @@
+{
+  "name": "fendeqing",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "dev": "npx --yes serve@14.2.4 site -l 5173"
+  }
+}
