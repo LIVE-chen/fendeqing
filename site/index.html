@@ -36,6 +36,16 @@
         <legend>谁来分 <button type="button" class="link" id="toggle-all">全选/全不选</button></legend>
         <div id="participants" class="chips"></div>
       </fieldset>
+      <fieldset>
+        <legend>怎么分</legend>
+        <div class="segmented" id="split-mode">
+          <label><input type="radio" name="splitMode" value="equal" checked />均摊</label>
+          <label><input type="radio" name="splitMode" value="ratio" />按比例</label>
+          <label><input type="radio" name="splitMode" value="amount" />按金额</label>
+        </div>
+        <div id="share-inputs" class="share-inputs" hidden></div>
+        <p id="split-preview" class="hint" aria-live="polite"></p>
+      </fieldset>
       <label>日期
         <input name="spentOn" type="date" required />
       </label>

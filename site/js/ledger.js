@@ -1,4 +1,4 @@
-import { parseAmount, formatCents, computeBalances, minimizeTransfers } from './settle.js';
+import { parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares } from './settle.js';
 import { store, isCloud, rememberLedger } from './store.js';
 import { h, $, toast, errMsg, today, withBusy } from './ui.js';
 
@@ -60,7 +60,7 @@ function paint(root) {
           h('button', { class: 'btn small', onclick: (ev) => markRepaid(root, ev.currentTarget, t) }, '标记已还')))),
     transfers.length ? h('p', { class: 'hint' }, `按最少转账计算：${transfers.length} 笔就能结清`) : null);
 
-  const balanceList = h('section', { class: 'card' },
+  const balanceList = h('section', { class: 'card', id: 'balances' },
     h('h2', {}, '每人余额'),
     h('ul', { class: 'list' }, state.members.map((m) => {
       const v = balances.get(m.id) ?? 0;
@@ -76,9 +76,13 @@ function paint(root) {
       ? h('p', { class: 'muted' }, '暂无记录')
       : h('ul', { class: 'list entries' }, state.entries.map((e) => {
           const isT = e.kind === 'transfer';
+          const weighted = e.splitMode === 'ratio' || e.splitMode === 'amount';
+          const who = weighted
+            ? entryShares(state.members, e).map(([id, c]) => `${nameOf(id)} ${formatCents(c)}`).join('、')
+            : `${e.participantIds.length === state.members.length ? '全员' : e.participantIds.map(nameOf).join('、')} 分摊`;
           const sub = isT
             ? `${nameOf(e.payerId)} 还给 ${nameOf(e.participantIds[0])}`
-            : `${nameOf(e.payerId)} 付款 · ${e.participantIds.length === state.members.length ? '全员' : e.participantIds.map(nameOf).join('、')} 分摊`;
+            : `${nameOf(e.payerId)} 付款 · ${weighted ? (e.splitMode === 'ratio' ? '按比例：' : '按金额：') : ''}${who}`;
           return h('li', {},
             h('div', { class: 'entry-main' },
               h('div', { class: 'entry-title' }, isT ? h('span', { class: 'tag' }, '还款') : null, e.title),
@@ -150,14 +154,61 @@ function openEntryDialog(root) {
   payer.replaceChildren(...state.members.map((m) => h('option', { value: m.id }, m.name)));
   $('#participants').replaceChildren(...state.members.map((m) =>
     h('label', { class: 'chip' }, h('input', { type: 'checkbox', name: 'participant', value: m.id, checked: true }), m.name)));
+  shareInputs.replaceChildren();
+  renderShareInputs();
   dialog.showModal();
   form.elements.title.focus();
 }
+
+// ---------- 分摊方式 ----------
+const shareInputs = $('#share-inputs');
+const preview = $('#split-preview');
+const splitMode = () => form.querySelector('input[name=splitMode]:checked').value;
+const checkedIds = () => [...form.querySelectorAll('input[name=participant]:checked')].map((b) => b.value);
+const shareValues = (ids) => ids.map((id) => shareInputs.querySelector(`input[data-id="${id}"]`)?.value ?? '');
+
+/** 按当前勾选的成员重建每人输入框；切换方式时清空已填的值，避免把比例误当金额 */
+function renderShareInputs({ keep = true } = {}) {
+  const mode = splitMode();
+  shareInputs.hidden = mode === 'equal';
+  const old = new Map(keep ? [...shareInputs.querySelectorAll('input')].map((i) => [i.dataset.id, i.value]) : []);
+  shareInputs.replaceChildren(...(mode === 'equal' ? [] : checkedIds().map((id) => {
+    const name = nameOf(id);
+    return h('label', { class: 'share-row' }, h('span', {}, name),
+      h('input', {
+        'data-id': id, name: 'share', inputmode: mode === 'ratio' ? 'numeric' : 'decimal', autocomplete: 'off',
+        'aria-label': `${name}的${mode === 'ratio' ? '份数' : '金额（元）'}`,
+        placeholder: mode === 'ratio' ? '份数' : '0.00', value: old.get(id) ?? (mode === 'ratio' ? '1' : ''),
+      }));
+  })));
+  updatePreview();
+}
+
+/** 实时提示：按比例时显示每人折算金额；按金额时显示与总额的差 */
+function updatePreview() {
+  const mode = splitMode();
+  const amount = parseAmount(form.elements.amount.value);
+  const ids = checkedIds();
+  errEl.textContent = ''; // 用户已在修改，旧的提交报错不再准确
+  preview.classList.remove('warn');
+  preview.textContent = '';
+  if (ids.length === 0 || amount == null) return;
+  const r = parseSplit(mode, amount, shareValues(ids));
+  if (!r.ok) { if (mode !== 'equal') { preview.textContent = r.error; preview.classList.add('warn'); } return; }
+  const shares = entryShares(state.members, { amount, participantIds: ids, splitMode: mode, shares: r.shares });
+  preview.textContent = mode === 'amount' ? '金额已对上 ✓' : shares.map(([id, c]) => `${nameOf(id)} ${formatCents(c)}`).join('，');
+}
+
+$('#split-mode').addEventListener('change', () => renderShareInputs({ keep: false }));
+$('#participants').addEventListener('change', () => renderShareInputs());
+shareInputs.addEventListener('input', updatePreview);
+form.elements.amount.addEventListener('input', updatePreview);
 
 $('#toggle-all').addEventListener('click', () => {
   const boxes = [...form.querySelectorAll('input[name=participant]')];
   const allOn = boxes.every((b) => b.checked);
   boxes.forEach((b) => { b.checked = !allOn; });
+  renderShareInputs();
 });
 // 提交请求进行中不允许关闭弹窗（Esc 触发 cancel 事件；取消按钮在提交期间同样无效）
 const submitting = () => $('#entry-submit').disabled;
@@ -180,11 +231,14 @@ form.addEventListener('submit', (ev) => {
   if (!title) return void (errEl.textContent = '请填写内容');
   if (amount == null) return void (errEl.textContent = '金额格式不对，最多两位小数，且大于 0、不超过 1000 万');
   if (participantIds.length === 0) return void (errEl.textContent = '至少选择一位分摊成员');
+  const mode = splitMode();
+  const split = parseSplit(mode, amount, shareValues(participantIds));
+  if (!split.ok) return void (errEl.textContent = split.error);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(spentOn) || spentOn > today()) return void (errEl.textContent = '请选择不晚于今天的日期');
 
   withBusy($('#entry-submit'), async () => {
     try {
-      await store.addEntry(state.token, { kind: 'expense', title, amount, payerId, participantIds, spentOn });
+      await store.addEntry(state.token, { kind: 'expense', title, amount, payerId, participantIds, spentOn, splitMode: mode, shares: split.shares });
       dialog.close();
       toast(`已记录 ${formatCents(amount)}`);
       await renderLedger(currentRoot, state.token, { quiet: true });

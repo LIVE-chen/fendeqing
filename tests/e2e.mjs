@@ -21,6 +21,11 @@ if (!base) {
     const p = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^([\\/])+/, '');
     const file = join(root, p || 'index.html');
     if (!file.startsWith(root)) { res.writeHead(403).end(); return; }
+    // 本地运行默认用本机模式，不往线上数据库写测试数据；E2E_CLOUD=1 时沿用 config.js 连云端
+    if (p.replace(/\\/g, '/') === 'js/config.js' && !process.env.E2E_CLOUD) {
+      res.writeHead(200, { 'Content-Type': 'text/javascript' }).end("export const CONFIG = { supabaseUrl: '', supabaseAnonKey: '' };");
+      return;
+    }
     try { res.writeHead(200, { 'Content-Type': types[extname(file)] || 'application/octet-stream' }).end(await readFile(file)); }
     catch { res.writeHead(404).end('not found'); }
   }).listen(0);
@@ -68,7 +73,7 @@ async function addExpense(title, amount, payerIdx, uncheck = []) {
   await page.selectOption('select[name=payer]', { index: payerIdx });
   for (const i of uncheck) await page.locator('input[name=participant]').nth(i).uncheck();
   await page.click('#entry-submit');
-  await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+  await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 }).catch(async (e) => { throw new Error('弹窗未关闭：' + await page.textContent('#entry-error') + ' / ' + errors.join(' | ')); });
   await page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
 }
 
@@ -168,6 +173,68 @@ if (isCloudMode) {
   await page.waitForSelector('.entries');
   ok((await page.textContent('.entries')).includes('另一台手机记的'), '原设备刷新后看到另一设备的新记录');
 }
+
+// #9 按比例 / 按金额分摊（新账本：我、小王、小李）
+await page.goto(base);
+await page.fill('input[name=ledgerName]', '云南五日游');
+await page.locator('input[name=member]').nth(1).fill('小王');
+await page.locator('input[name=member]').nth(2).fill('小李');
+await page.click('text=创建账本');
+await page.waitForSelector('.ledger-head');
+await hideToast();
+const pickMode = (label) => page.locator('#split-mode label', { hasText: label }).click();
+const share = (i) => page.locator('#share-inputs input').nth(i);
+
+// 按比例：房费 300，我 2 份、小王 1 份、小李 0 人（不参与）
+await page.click('.fab');
+await page.fill('input[name=title]', '民宿（按房间大小）');
+await page.fill('input[name=amount]', '300');
+await page.locator('input[name=participant]').nth(2).uncheck();
+await pickMode('按比例');
+ok(await page.locator('#share-inputs input').count() === 2, '按比例：只为勾选的成员显示份数输入框');
+await share(0).fill('2');
+ok((await page.textContent('#split-preview')).includes('我 ¥200.00，小王 ¥100.00'), '按比例：实时显示每人折算金额');
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
+
+// 按金额：聚餐 100，小王 30、小李 70，由小李付
+await page.click('.fab');
+await page.fill('input[name=title]', '晚饭（小王只喝饮料）');
+await page.fill('input[name=amount]', '100');
+await page.selectOption('select[name=payer]', { index: 2 });
+await page.locator('input[name=participant]').nth(0).uncheck();
+await pickMode('按金额');
+await share(0).fill('30');
+await share(1).fill('60');
+ok((await page.textContent('#split-preview')).includes('还差 ¥10.00'), '按金额：合计不符时实时提示差额');
+await page.click('#entry-submit');
+ok((await page.textContent('#entry-error')).includes('还差'), '按金额：合计不符时不能保存');
+await share(1).fill('70');
+ok((await page.textContent('#entry-error')) === '', '修正金额后旧报错自动清除');
+await hideToast();
+await page.screenshot({ path: shots + '5-split.png' });
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
+
+// 我付 300（我 200 / 小王 100），小李付 100（小王 30 / 小李 70）
+// → 我 +100，小王 -130，小李 +30
+const balText = await page.textContent('#balances');
+ok(balText.includes('我应收 ¥100.00') && balText.includes('小王应付 ¥130.00') && balText.includes('小李应收 ¥30.00'), '按比例 + 按金额：余额计算正确');
+ok((await page.textContent('.entries')).includes('按金额：小王 ¥30.00、小李 ¥70.00'), '流水显示每人分摊金额');
+await page.reload();
+await page.waitForSelector('.entries');
+ok((await page.textContent('#balances')).includes('小王应付 ¥130.00'), '刷新后分摊方式仍然保留');
+// 切换方式后旧值被清空：防止把比例当成金额
+await page.click('.fab');
+await pickMode('按比例');
+await share(0).fill('5');
+await pickMode('按金额');
+ok(await share(0).inputValue() === '', '切换分摊方式时清空已填的值');
+await page.keyboard.press('Escape');
+await hideToast();
+await page.screenshot({ path: shots + '6-split-ledger.png', fullPage: true });
 
 // 无效链接
 await page.goto(base + '#/l/abc');
