@@ -45,7 +45,15 @@ const cloud = {
     // 均摊时不传新参数：数据库尚未迁移时，最常用的均摊记账仍然可用
     ...(e.splitMode && e.splitMode !== 'equal' ? { p_split_mode: e.splitMode, p_shares: e.shares } : {}),
   }),
+  updateEntry: (token, id, e) => rpc('update_entry', {
+    p_token: token, p_entry: id, p_title: e.title, p_amount: e.amount,
+    p_payer: e.payerId, p_participants: e.participantIds, p_spent_on: e.spentOn,
+    p_split_mode: e.splitMode ?? 'equal', p_shares: e.splitMode && e.splitMode !== 'equal' ? e.shares : null,
+  }),
   deleteEntry: (token, id) => rpc('delete_entry', { p_token: token, p_entry: id }),
+  addMember: (token, name) => rpc('add_member', { p_token: token, p_name: name }),
+  renameMember: (token, id, name) => rpc('rename_member', { p_token: token, p_member: id, p_name: name }),
+  leaveMember: (token, id) => rpc('leave_member', { p_token: token, p_member: id }),
 };
 
 // ---------- 本地 ----------
@@ -71,10 +79,15 @@ const local = {
     writeLocal(token, { name, members: members.map((n) => ({ id: uuid(), name: n })), entries: [] });
     return token;
   },
-  async getLedger(token) { return readLocal(token); },
+  async getLedger(token) {
+    const d = readLocal(token);
+    d.members = d.members.map((m) => ({ ...m, left: Boolean(m.left) })); // 旧数据没有 left 字段
+    return d;
+  },
   async addEntry(token, e) {
     const d = readLocal(token);
     if (d.entries.length >= 2000) throw new StoreError('单个账本最多 2000 条记录');
+    if (e.kind === 'expense') checkActive(d, e, []);
     const id = uuid();
     const splitMode = e.splitMode ?? 'equal';
     d.entries.unshift({ id, ...e, splitMode, shares: splitMode === 'equal' ? null : e.shares, createdAt: new Date().toISOString() });
@@ -87,7 +100,56 @@ const local = {
     d.entries = d.entries.filter((x) => x.id !== id);
     writeLocal(token, d);
   },
+  // 以下规则与服务端 update_entry / add_member / rename_member / leave_member 保持一致
+  async updateEntry(token, id, e) {
+    const d = readLocal(token);
+    const old = d.entries.find((x) => x.id === id);
+    if (!old) throw new StoreError('记录不存在');
+    if (old.kind !== 'expense') throw new StoreError('还款记录不能编辑，可以删除后重新标记');
+    checkActive(d, e, [...old.participantIds, old.payerId]);
+    const splitMode = e.splitMode ?? 'equal';
+    Object.assign(old, {
+      title: e.title, amount: e.amount, payerId: e.payerId, participantIds: e.participantIds, spentOn: e.spentOn,
+      splitMode, shares: splitMode === 'equal' ? null : e.shares, updatedAt: new Date().toISOString(),
+    });
+    d.entries.sort((a, b) => (b.spentOn + b.createdAt).localeCompare(a.spentOn + a.createdAt));
+    writeLocal(token, d);
+  },
+  async addMember(token, name) {
+    const d = readLocal(token);
+    const same = d.members.find((m) => m.name === name);
+    if (same && !same.left) throw new StoreError('已有同名成员');
+    if (d.members.filter((m) => !m.left).length >= 20) throw new StoreError('最多 20 位成员');
+    if (same) { same.left = false; writeLocal(token, d); return same.id; }
+    if (d.members.length >= 50) throw new StoreError('成员总数（含已退出）最多 50 位');
+    const id = uuid();
+    d.members.push({ id, name, left: false });
+    writeLocal(token, d);
+    return id;
+  },
+  async renameMember(token, id, name) {
+    const d = readLocal(token);
+    const m = d.members.find((x) => x.id === id);
+    if (!m) throw new StoreError('成员不存在');
+    if (d.members.some((x) => x.name === name && x.id !== id)) throw new StoreError('已有同名成员（含已退出的成员）');
+    m.name = name;
+    writeLocal(token, d);
+  },
+  async leaveMember(token, id) {
+    const d = readLocal(token);
+    const m = d.members.find((x) => x.id === id && !x.left);
+    if (!m) throw new StoreError('成员不存在或已退出');
+    if (d.members.filter((x) => !x.left).length <= 2) throw new StoreError('账本至少需要 2 位成员');
+    m.left = true;
+    writeLocal(token, d);
+  },
 };
+
+/** 支出不能涉及已退出成员（extra 中的除外：编辑时保留原记录里的人） */
+function checkActive(d, e, extra) {
+  const left = new Set(d.members.filter((m) => m.left && !extra.includes(m.id)).map((m) => m.id));
+  if ([e.payerId, ...e.participantIds].some((id) => left.has(id))) throw new StoreError('已退出的成员不能参与新的支出');
+}
 
 export const store = isCloud ? cloud : local;
 export const isValidToken = (t) => TOKEN_RE.test(t);
