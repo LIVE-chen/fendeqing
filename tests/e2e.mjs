@@ -2,7 +2,7 @@
 //：本地静态服务器 + Chromium 手机视口（iPhone 12 尺寸）
 // 运行：NODE_PATH=<workspace>/node_modules node tests/e2e.mjs [baseUrl]
 import { createServer } from 'node:http';
-import { readFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -243,6 +243,48 @@ await page.screenshot({ path: shots + '5-split.png' });
 await page.click('#entry-submit');
 await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
 await page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
+
+// #11 统计：每人实际消费 = 我 200、小王 130、小李 70；本月支出 400
+const barRows = (sel) => page.$$eval(sel, (lis) => lis.map((li) => li.querySelector('.bar-label').textContent + ' ' + li.querySelector('.amount').textContent));
+ok((await barRows('#stats .bars:not(.per-member) li')).some((t) => t.endsWith('¥400.00')), '统计：每月支出合计');
+ok(JSON.stringify(await barRows('#stats .per-member li')) === JSON.stringify(['我 ¥200.00', '小王 ¥130.00', '小李 ¥70.00']), '统计：每人实际消费按分摊计算');
+// 导出 Excel：真实下载并解析
+{
+  const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#export-xlsx')]);
+  ok(/^云南五日游-\d{4}-\d{2}-\d{2}\.xlsx$/.test(dl.suggestedFilename()), '导出文件名为"账本名-日期.xlsx"');
+  const buf = await readFile(await dl.path());
+  ok(buf[0] === 0x50 && buf[1] === 0x4b, '导出文件是 ZIP（xlsx）格式');
+  const text = buf.toString('utf8');
+  ok(['流水', '每人余额', '结算方案', '按月统计', '民宿（按房间大小）', '按金额'].every((s) => text.includes(s)), '导出内容包含 4 张表和流水明细');
+  if (process.env.E2E_EXPORT) await writeFile(process.env.E2E_EXPORT, buf); // 供 Excel/openpyxl 二次核对
+  await hideToast();
+  await page.locator('#stats').scrollIntoViewIfNeeded();
+  await page.evaluate(() => { document.querySelector('.fab').hidden = true; });
+  await page.locator('#stats').screenshot({ path: shots + '10-stats.png' });
+  await page.evaluate(() => { document.querySelector('.fab').hidden = false; });
+  const tracks = await page.$$eval('#stats .bar-track', (els) => els.map((e) => Math.round(e.getBoundingClientRect().width)));
+  ok(new Set(tracks).size === 1, '统计：各行条形图轨道等长，长度可比');
+}
+// 条形图在真实 CSP 下也能显示（其余用例开了 bypassCSP，这里单独检查）
+{
+  const strict = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const sp = await strict.newPage();
+  const cspErr = [];
+  // Netlify 注入的工具条（/.netlify/scripts/* 和它的 srcdoc iframe）被拦截属于预期，与主流程的统计口径一致
+  sp.on('console', (m) => {
+    const src = m.location()?.url || '';
+    if (/Content Security Policy/.test(m.text()) && !src.includes('/.netlify/') && src !== 'about:srcdoc') cspErr.push(`${m.text()} @ ${src}`);
+  });
+  // 只有线上（Netlify 下发 CSP 响应头）且云端模式时才能在新上下文打开同一账本
+  if (isCloudMode && !server) {
+    await sp.goto(page.url());
+    await sp.waitForSelector('#stats .bar-fill');
+    const w = await sp.$$eval('#stats .bar-fill', (els) => els.map((e) => e.getBoundingClientRect().width));
+    ok(w.length > 0 && w.every((x) => x > 0), '真实 CSP 下条形图宽度生效');
+    ok(cspErr.length === 0, '真实 CSP 下站点自身无 CSP 报错 ' + cspErr.join(' | '));
+  }
+  await strict.close();
+}
 
 // 我付 300（我 200 / 小王 100），小李付 100（小王 30 / 小李 70）
 // → 我 +100，小王 -130，小李 +30

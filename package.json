@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/settle.test.mjs",
+    "test": "node --test tests/settle.test.mjs tests/stats.test.mjs",
     "test:sql": "node --test tests/sql.test.mjs",
     "test:e2e": "node tests/e2e.mjs",
     "dev": "npx --yes serve@14.2.4 site -l 5173"
