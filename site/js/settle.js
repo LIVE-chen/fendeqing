@@ -173,3 +173,28 @@ export function validateMembers(names) {
   if (new Set(cleaned).size !== cleaned.length) return { ok: false, error: '成员名字不能重复' };
   return { ok: true, names: cleaned };
 }
+
+const ACTION_TEXT = {
+  create: (d) => `创建账本「${d.name}」，成员：${(d.members ?? []).join('、')}`,
+  add_entry: (d) => (d.kind === 'transfer' ? `记录还款 ${formatCents(d.amount)}` : `记一笔「${d.title}」${formatCents(d.amount)}`),
+  update_entry: (d) => {
+    const parts = [];
+    if (d.oldTitle !== d.title) parts.push(`「${d.oldTitle}」→「${d.title}」`);
+    else parts.push(`「${d.title}」`);
+    if (d.oldAmount !== d.amount) parts.push(`${formatCents(d.oldAmount)} → ${formatCents(d.amount)}`);
+    return `编辑${parts.join(' ')}`;
+  },
+  delete_entry: (d) => `删除${d.kind === 'transfer' ? '还款' : ''}「${d.title}」${formatCents(d.amount)}`,
+  restore_entry: (d) => `恢复${d.kind === 'transfer' ? '还款' : ''}「${d.title}」${formatCents(d.amount)}`,
+  add_member: (d) => `添加成员${d.name}`,
+  rename_member: (d) => `${d.oldName} 改名为 ${d.name}`,
+  leave_member: (d) => `${d.name}退出账本`,
+  restore_member: (d) => `${d.name}重新加入`,
+};
+
+/** 操作日志 → 一句话描述；未知类型（例如新版本才有的操作）不报错 */
+export function describeActivity(a) {
+  const f = ACTION_TEXT[a?.action];
+  if (!f) return '其他操作';
+  try { return f(a.detail ?? {}); } catch { return '其他操作'; }
+}

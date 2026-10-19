@@ -73,6 +73,20 @@
     </div>
   </dialog>
 
+  <dialog id="history-dialog" aria-labelledby="history-dialog-title">
+    <div class="dialog-body">
+      <h2 id="history-dialog-title">历史</h2>
+      <h3>最近删除</h3>
+      <p class="hint">删除的记录保留 30 天，恢复后余额会重新计算。</p>
+      <ul id="history-deleted" class="list history"></ul>
+      <h3>操作记录</h3>
+      <ul id="history-log" class="list history log"></ul>
+      <div class="actions">
+        <button type="button" class="btn ghost" id="history-close">完成</button>
+      </div>
+    </div>
+  </dialog>
+
   <noscript><p class="card">需要开启 JavaScript 才能使用分得清。</p></noscript>
   <script type="module" src="./js/app.js"></script>
 </body>

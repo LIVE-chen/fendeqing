@@ -1,6 +1,6 @@
 import {
   parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares,
-  centsToInput, canLeave, isActive, validateMemberName,
+  centsToInput, canLeave, isActive, validateMemberName, describeActivity,
 } from './settle.js';
 import { store, isCloud, rememberLedger } from './store.js';
 import { h, $, toast, errMsg, today, withBusy } from './ui.js';
@@ -59,6 +59,7 @@ function paint(root) {
     h('div', { class: 'actions wrap' },
       h('button', { class: 'btn ghost', onclick: () => copyLink(shareUrl) }, isCloud ? '复制邀请链接' : '复制链接'),
       h('button', { class: 'btn ghost', id: 'open-members', onclick: () => openMembersDialog(root) }, '成员'),
+      h('button', { class: 'btn ghost', id: 'open-history', onclick: () => openHistoryDialog(root) }, '历史'),
       h('button', { class: 'btn ghost', 'aria-label': '刷新账本', onclick: () => renderLedger(root, state.token) }, '刷新')));
 
   const settle = h('section', { class: 'card', id: 'settle' },
@@ -144,14 +145,23 @@ async function markRepaid(root, btn, t) {
 }
 
 async function removeEntry(root, btn, e) {
-  if (!confirm(`删除「${e.title}」${formatCents(e.amount)}？删除后无法恢复。`)) return;
+  if (!confirm(`删除「${e.title}」${formatCents(e.amount)}？30 天内可以在"历史"里恢复。`)) return;
   await withBusy(btn, async () => {
     try {
       await store.deleteEntry(state.token, e.id);
-      toast('已删除');
       await renderLedger(root, state.token, { quiet: true });
+      toast('已删除', false, { label: '撤销', onClick: () => restoreEntry(root, e.id) });
     } catch (err) { toast(errMsg(err), true); }
   });
+}
+
+async function restoreEntry(root, id) {
+  try {
+    await store.restoreEntry(state.token, id);
+    toast('已恢复');
+    await renderLedger(root, state.token, { quiet: true });
+    return true;
+  } catch (err) { toast(errMsg(err), true); return false; }
 }
 
 // ---------- 记一笔弹窗 ----------
@@ -391,3 +401,46 @@ mAddForm.addEventListener('submit', (ev) => {
   });
 });
 $('#members-close').addEventListener('click', () => mDialog.close());
+
+// ---------- 历史弹窗：最近删除（可恢复）+ 操作记录 ----------
+const hDialog = $('#history-dialog');
+const hDeleted = $('#history-deleted');
+const hLog = $('#history-log');
+let hRoot = null;
+
+const fmtTime = (iso) => {
+  const d = new Date(iso);
+  const p = (n) => String(n).padStart(2, '0');
+  return Number.isNaN(d.getTime()) ? '' : `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+
+async function openHistoryDialog(root) {
+  hRoot = root;
+  hDeleted.replaceChildren(h('li', { class: 'muted' }, '加载中…'));
+  hLog.replaceChildren();
+  hDialog.showModal();
+  await loadHistory();
+}
+
+async function loadHistory() {
+  try {
+    const { deleted, activities } = await store.getHistory(state.token);
+    if (!hDialog.open) return;
+    hDeleted.replaceChildren(...(deleted.length ? deleted.map((e) => h('li', {},
+      h('div', { class: 'entry-main' },
+        h('div', { class: 'entry-title' }, e.kind === 'transfer' ? h('span', { class: 'tag' }, '还款') : null, e.title),
+        h('div', { class: 'muted small' }, `${e.spentOn} · ${nameOf(e.payerId)} ${e.kind === 'transfer' ? '还款' : '付款'} · 删除于 ${fmtTime(e.deletedAt)}`)),
+      h('span', { class: 'amount' }, formatCents(e.amount)),
+      h('button', {
+        type: 'button', class: 'btn small', 'aria-label': `恢复 ${e.title}`,
+        onclick: (ev) => withBusy(ev.currentTarget, async () => { if (await restoreEntry(hRoot, e.id)) await loadHistory(); }),
+      }, '恢复'))) : [h('li', { class: 'muted' }, '30 天内没有删除过记录')]));
+    hLog.replaceChildren(...(activities.length ? activities.map((a) => h('li', {},
+      h('span', { class: 'log-text' }, describeActivity(a)),
+      h('time', { class: 'muted small', datetime: a.at }, fmtTime(a.at)))) : [h('li', { class: 'muted' }, '暂无记录')]));
+  } catch (e) {
+    console.error('[history]', e);
+    hDeleted.replaceChildren(h('li', { class: 'form-error' }, errMsg(e)));
+  }
+}
+$('#history-close').addEventListener('click', () => hDialog.close());

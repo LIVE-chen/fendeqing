@@ -280,3 +280,93 @@ test('编辑支出：原记录里的退出成员可以保留，不能新加入�
   await upd([ids[2]], ids[2]);
   await rejects(upd([ids[0], ids[3]]), /已退出/);
 });
+
+// ---------- #14 软删除与操作日志 ----------
+const history = async (t) => (await asAnon('select public.get_history($1) h', [t])).rows[0].h;
+
+test('删除进回收站：账本里消失、历史里可见、可恢复且不能重复恢复', async () => {
+  const { t, ids, get, addE } = await ledgerWith(['a', 'b'], '40.0.0.1');
+  const e = await addE(ids[0], ids);
+  await asAnon('select public.delete_entry($1,$2)', [t, e]);
+  assert.equal((await get()).entries.length, 0);
+  await rejects(asAnon('select public.delete_entry($1,$2)', [t, e]), /记录不存在/);
+  const h = await history(t);
+  assert.equal(h.deleted.length, 1);
+  assert.equal(h.deleted[0].id, e);
+  assert.ok(h.deleted[0].deletedAt);
+  await asAnon('select public.restore_entry($1,$2)', [t, e]);
+  assert.equal((await get()).entries.length, 1);
+  assert.equal((await history(t)).deleted.length, 0);
+  await rejects(asAnon('select public.restore_entry($1,$2)', [t, e]), /已恢复/);
+});
+
+test('已删除的记录不能编辑；恢复涉及退出成员的记录也可以', async () => {
+  const { t, ids, addE } = await ledgerWith(['a', 'b', 'c'], '40.0.0.2');
+  const e = await addE(ids[2], ids);
+  await asAnon('select public.delete_entry($1,$2)', [t, e]);
+  await rejects(asAnon(`select public.update_entry($1,$2,'x',100,$3,$4::uuid[],current_date)`, [t, e, ids[0], ids]), /记录不存在/);
+  await asAnon('select public.leave_member($1,$2)', [t, ids[2]]);
+  await asAnon('select public.restore_entry($1,$2)', [t, e]);
+});
+
+test('回收站与日志跨账本隔离；anon 不能读日志表、不能调 _log', async () => {
+  const A = await ledgerWith(['a', 'b'], '40.0.0.3');
+  const B = await ledgerWith(['x', 'y'], '40.0.0.3');
+  const e = await A.addE(A.ids[0], A.ids);
+  await asAnon('select public.delete_entry($1,$2)', [A.t, e]);
+  await rejects(asAnon('select public.restore_entry($1,$2)', [B.t, e]), /记录不存在/);
+  const hb = await history(B.t);
+  assert.equal(hb.deleted.length, 0);
+  assert.ok(hb.activities.every((x) => x.action === 'create'));
+  await rejects(asAnon('select * from public.activities'), /permission denied/);
+  await rejects(asAnon(`select public._log(gen_random_uuid(), 'x', '{}')`), /permission denied/);
+});
+
+test('操作日志：记录所有写操作，最新在前，含新旧值', async () => {
+  const { t, ids, addE } = await ledgerWith(['a', 'b', 'c'], '40.0.0.4');
+  const e = await addE(ids[0], ids);
+  await asAnon(`select public.update_entry($1,$2,'改',500,$3,$4::uuid[],current_date)`, [t, e, ids[0], ids]);
+  await asAnon('select public.delete_entry($1,$2)', [t, e]);
+  await asAnon('select public.restore_entry($1,$2)', [t, e]);
+  await asAnon(`select public.add_member($1,'d')`, [t]);
+  await asAnon(`select public.rename_member($1,$2,'A')`, [t, ids[0]]);
+  await asAnon('select public.leave_member($1,$2)', [t, ids[2]]);
+  await asAnon(`select public.add_member($1,'c')`, [t]);
+  const acts = (await history(t)).activities;
+  assert.deepEqual(acts.map((x) => x.action), ['restore_member', 'leave_member', 'rename_member', 'add_member',
+    'restore_entry', 'delete_entry', 'update_entry', 'add_entry', 'create']);
+  assert.deepEqual(acts.find((x) => x.action === 'update_entry').detail, { title: '改', amount: 500, oldTitle: 't', oldAmount: 300 });
+  assert.deepEqual(acts.find((x) => x.action === 'rename_member').detail, { name: 'A', oldName: 'a' });
+  assert.deepEqual(acts.at(-1).detail, { name: 'm', members: ['a', 'b', 'c'] });
+});
+
+test('上限：回收站最多 100 条、超过 30 天自动清理；日志最多 500 条；删除的记录不占 2000 条额度', async () => {
+  const { t, ids, get, addE } = await ledgerWith(['a', 'b'], '40.0.0.5');
+  const lid = (await db.query(`select ledger_id l from public.members where id = $1`, [ids[0]])).rows[0].l;
+  // 直接造数据：100 条近期删除 + 1 条 40 天前删除，再删一条（共 102 条）触发清理
+  await db.query(`insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids, deleted_at)
+    select $1, 'expense', 'old' || g, 100, $2, $3::uuid[], now() - (g || ' minutes')::interval from generate_series(1, 100) g`, [lid, ids[0], ids]);
+  await db.query(`insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids, deleted_at)
+    values ($1, 'expense', 'ancient', 100, $2, $3::uuid[], now() - interval '40 days')`, [lid, ids[0], ids]);
+  const e = await addE(ids[0], ids);
+  await asAnon('select public.delete_entry($1,$2)', [t, e]);
+  const n = (await db.query(`select count(*)::int n, bool_or(title = 'ancient') o, bool_or(title = 'old99') keep, bool_or(title = 'old100') last from public.entries where ledger_id = $1 and deleted_at is not null`, [lid])).rows[0];
+  assert.equal(n.n, 100);
+  assert.equal(n.o, false, '30 天前删除的已清理');
+  assert.equal(n.last, false, '超出 100 条时清掉最早删除的');
+  assert.equal(n.keep, true);
+  assert.equal((await history(t)).deleted.length, 100);
+  await db.query(`insert into public.activities (ledger_id, action) select $1, 'x' from generate_series(1, 600)`, [lid]);
+  await addE(ids[0], ids);
+  assert.equal((await db.query('select count(*)::int n from public.activities where ledger_id = $1', [lid])).rows[0].n, 500);
+  assert.equal((await history(t)).activities.length, 100);
+  assert.equal((await history(t)).activities[0].action, 'add_entry');
+  // 1999 条在账 + 100 条在回收站：还能再记 1 条
+  await db.query(`insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids)
+    select $1, 'expense', 'live', 100, $2, $3::uuid[] from generate_series(1, 1998) g`, [lid, ids[0], ids]);
+  assert.equal((await get()).entries.length, 1999);
+  await addE(ids[0], ids);
+  await rejects(addE(ids[0], ids), /2000/);
+  const del = (await history(t)).deleted[0].id;
+  await rejects(asAnon('select public.restore_entry($1,$2)', [t, del]), /2000/);
+});

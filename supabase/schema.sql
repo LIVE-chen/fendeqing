@@ -1,7 +1,7 @@
 -- 分得清 · Supabase 数据库结构（在 SQL Editor 中整段运行，可重复执行）
 -- 安全模型：
 --   * 表全部开启 RLS 且不建策略，并撤销 anon/authenticated 的表权限 => 无法直接读写表；
---   * 前端只能调用 8 个 SECURITY DEFINER 函数，每个都要求提供账本分享口令 token；
+--   * 前端只能调用 10 个 SECURITY DEFINER 函数，每个都要求提供账本分享口令 token；
 --   * token = 128 bit 密码学随机数，只出现在 URL 的 # 片段里；数据库只存 sha256(token)；
 --   * 创建账本按 IP 限流，所有文本在服务端再次校验长度、空白和控制字符。
 begin;
@@ -50,6 +50,20 @@ end $$;
 -- 成员退出与记录编辑（#10）：退出只打标记、不删行，历史流水和余额保持不变
 alter table public.members add column if not exists left_at timestamptz;
 alter table public.entries add column if not exists updated_at timestamptz;
+-- 软删除与操作日志（#14）：删除只打标记，可在"历史"里恢复；所有写操作记日志。
+-- 回收站保留 30 天、每账本最多 100 条（防止反复增删撑大数据库）；日志每账本保留最近 500 条。
+alter table public.entries add column if not exists deleted_at timestamptz;
+create index if not exists entries_deleted_idx on public.entries (ledger_id, deleted_at) where deleted_at is not null;
+create table if not exists public.activities (
+  id bigint generated always as identity primary key,
+  ledger_id uuid not null references public.ledgers(id) on delete cascade,
+  at timestamptz not null default now(),
+  action text not null,
+  detail jsonb not null default '{}'
+);
+create index if not exists activities_ledger_idx on public.activities (ledger_id, id desc);
+alter table public.activities enable row level security;
+revoke all on public.activities from public, anon, authenticated;
 create index if not exists entries_ledger_idx on public.entries (ledger_id, created_at desc);
 create index if not exists members_ledger_idx on public.members (ledger_id, position);
 
@@ -71,6 +85,15 @@ begin
     raise exception '%包含不支持的字符', p_label using errcode = '22023';
   end if;
   return v;
+end $$;
+
+-- 内部：写一条操作日志，每个账本只保留最近 500 条
+create or replace function public._log(p_ledger uuid, p_action text, p_detail jsonb) returns void
+language plpgsql volatile set search_path = '' as $$
+begin
+  insert into public.activities (ledger_id, action, detail) values (p_ledger, p_action, coalesce(p_detail, '{}'));
+  delete from public.activities where ledger_id = p_ledger and id <= (
+    select id from public.activities where ledger_id = p_ledger order by id desc offset 500 limit 1);
 end $$;
 
 -- 内部：token -> ledger id
@@ -132,6 +155,7 @@ begin
   returning id into v_id;
   insert into public.members (ledger_id, name, position)
   select v_id, x.name, x.ord from unnest(v_names) with ordinality as x(name, ord);
+  perform public._log(v_id, 'create', jsonb_build_object('name', v_name, 'members', to_jsonb(v_names)));
   return v_token;
 end $$;
 
@@ -148,7 +172,23 @@ begin
                   'participantIds', participant_ids, 'spentOn', spent_on, 'createdAt', created_at,
                   'splitMode', split_mode, 'shares', shares, 'updatedAt', updated_at)
                   order by spent_on desc, created_at desc)
-                 from public.entries where ledger_id = v_id), '[]'::json)
+                 from public.entries where ledger_id = v_id and deleted_at is null), '[]'::json)
+  );
+end $$;
+
+-- 历史：最近删除的记录（可恢复）与操作日志，各取最近 100 条
+create or replace function public.get_history(p_token text)
+returns json language plpgsql stable security definer set search_path = '' as $$
+declare v_id uuid := public._ledger_id(p_token);
+begin
+  return json_build_object(
+    'deleted', coalesce((select json_agg(json_build_object(
+                  'id', id, 'kind', kind, 'title', title, 'amount', amount, 'payerId', payer_id,
+                  'participantIds', participant_ids, 'spentOn', spent_on, 'deletedAt', deleted_at) order by deleted_at desc, id)
+                 from (select * from public.entries where ledger_id = v_id and deleted_at is not null
+                        order by deleted_at desc, id limit 100) d), '[]'::json),
+    'activities', coalesce((select json_agg(json_build_object('at', at, 'action', action, 'detail', detail) order by id desc)
+                 from (select * from public.activities where ledger_id = v_id order by id desc limit 100) a), '[]'::json)
   );
 end $$;
 
@@ -230,13 +270,14 @@ declare
 begin
   -- 锁住账本行，避免并发请求突破 2000 条上限，也避免与成员退出并发
   perform 1 from public.ledgers where id = v_id for update;
-  if (select count(*) from public.entries where ledger_id = v_id) >= 2000 then
+  if (select count(*) from public.entries where ledger_id = v_id and deleted_at is null) >= 2000 then
     raise exception '单个账本最多 2000 条记录' using errcode = '54000';
   end if;
   select * into v_chk from public._check_entry(v_id, p_kind, p_amount, p_payer, p_participants, p_spent_on, p_split_mode, p_shares, null);
   insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids, spent_on, split_mode, shares)
   values (v_id, p_kind, v_title, p_amount, p_payer, v_chk.o_parts, p_spent_on, coalesce(p_split_mode, 'equal'), v_chk.o_shares)
   returning id into v_new;
+  perform public._log(v_id, 'add_entry', jsonb_build_object('kind', p_kind, 'title', v_title, 'amount', p_amount));
   return v_new;
 end $$;
 
@@ -253,8 +294,8 @@ declare
   v_chk record;
 begin
   perform 1 from public.ledgers where id = v_id for update;
-  select kind, payer_id, participant_ids into v_old
-    from public.entries where id = p_entry and ledger_id = v_id for update;
+  select kind, title, amount, payer_id, participant_ids into v_old
+    from public.entries where id = p_entry and ledger_id = v_id and deleted_at is null for update;
   if not found then
     raise exception '记录不存在' using errcode = 'P0002';
   end if;
@@ -267,6 +308,8 @@ begin
      set title = v_title, amount = p_amount, payer_id = p_payer, participant_ids = v_chk.o_parts,
          spent_on = p_spent_on, split_mode = coalesce(p_split_mode, 'equal'), shares = v_chk.o_shares, updated_at = now()
    where id = p_entry;
+  perform public._log(v_id, 'update_entry', jsonb_build_object(
+    'title', v_title, 'amount', p_amount, 'oldTitle', v_old.title, 'oldAmount', v_old.amount));
 end $$;
 
 -- 添加成员；名字与已退出成员相同时恢复该成员
@@ -288,6 +331,7 @@ begin
   end if;
   if found then
     update public.members set left_at = null where id = v_m.id;
+    perform public._log(v_id, 'restore_member', jsonb_build_object('name', v_name));
     return v_m.id;
   end if;
   if (select count(*) from public.members where ledger_id = v_id) >= 50 then
@@ -296,6 +340,7 @@ begin
   insert into public.members (ledger_id, name, position)
   values (v_id, v_name, (select coalesce(max(position), 0) + 1 from public.members where ledger_id = v_id))
   returning id into v_new;
+  perform public._log(v_id, 'add_member', jsonb_build_object('name', v_name));
   return v_new;
 end $$;
 
@@ -304,15 +349,18 @@ returns void language plpgsql volatile security definer set search_path = '' as 
 declare
   v_id uuid := public._ledger_id(p_token);
   v_name text := public._clean(p_name, 20, '成员名字');
+  v_old text;
 begin
   perform 1 from public.ledgers where id = v_id for update;
-  if not exists (select 1 from public.members where id = p_member and ledger_id = v_id) then
+  select name into v_old from public.members where id = p_member and ledger_id = v_id;
+  if not found then
     raise exception '成员不存在' using errcode = 'P0002';
   end if;
   if exists (select 1 from public.members where ledger_id = v_id and name = v_name and id <> p_member) then
     raise exception '已有同名成员（含已退出的成员）' using errcode = '22023';
   end if;
   update public.members set name = v_name where id = p_member;
+  perform public._log(v_id, 'rename_member', jsonb_build_object('name', v_name, 'oldName', v_old));
 end $$;
 
 -- 退出账本：只打标记，历史记录与余额不变。余额是否结清由前端把关（算法只在 settle.js 实现一份）
@@ -328,24 +376,59 @@ begin
     raise exception '账本至少需要 2 位成员' using errcode = '22023';
   end if;
   update public.members set left_at = now() where id = p_member;
+  perform public._log(v_id, 'leave_member', jsonb_build_object('name', (select name from public.members where id = p_member)));
 end $$;
 
+-- 删除 = 移入回收站（软删除）。顺带清理：超过 30 天的、超出 100 条的已删除记录才真正删掉
 create or replace function public.delete_entry(p_token text, p_entry uuid)
 returns void language plpgsql volatile security definer set search_path = '' as $$
-declare v_id uuid := public._ledger_id(p_token);
+declare
+  v_id uuid := public._ledger_id(p_token);
+  v_e record;
 begin
-  delete from public.entries where id = p_entry and ledger_id = v_id;
+  perform 1 from public.ledgers where id = v_id for update;
+  update public.entries set deleted_at = now()
+   where id = p_entry and ledger_id = v_id and deleted_at is null
+  returning kind, title, amount into v_e;
   if not found then
     raise exception '记录不存在' using errcode = 'P0002';
   end if;
+  delete from public.entries where ledger_id = v_id and deleted_at is not null
+     and (deleted_at < now() - interval '30 days' or id in (
+       select id from public.entries where ledger_id = v_id and deleted_at is not null
+        order by deleted_at desc, id offset 100));
+  perform public._log(v_id, 'delete_entry', jsonb_build_object('kind', v_e.kind, 'title', v_e.title, 'amount', v_e.amount));
 end $$;
 
--- 权限：内部函数不对外；只开放 8 个 RPC
+-- 从回收站恢复。记录涉及的成员已退出也照样恢复：恢复的是历史，不是新支出
+create or replace function public.restore_entry(p_token text, p_entry uuid)
+returns void language plpgsql volatile security definer set search_path = '' as $$
+declare
+  v_id uuid := public._ledger_id(p_token);
+  v_e record;
+begin
+  perform 1 from public.ledgers where id = v_id for update;
+  if (select count(*) from public.entries where ledger_id = v_id and deleted_at is null) >= 2000 then
+    raise exception '单个账本最多 2000 条记录' using errcode = '54000';
+  end if;
+  update public.entries set deleted_at = null
+   where id = p_entry and ledger_id = v_id and deleted_at is not null
+  returning kind, title, amount into v_e;
+  if not found then
+    raise exception '记录不存在或已恢复' using errcode = 'P0002';
+  end if;
+  perform public._log(v_id, 'restore_entry', jsonb_build_object('kind', v_e.kind, 'title', v_e.title, 'amount', v_e.amount));
+end $$;
+
+-- 权限：内部函数不对外；只开放 10 个 RPC
 revoke all on function public._clean(text, int, text) from public, anon, authenticated;
 revoke all on function public._ledger_id(text) from public, anon, authenticated;
+revoke all on function public._log(uuid, text, jsonb) from public, anon, authenticated;
 revoke all on function public._check_entry(uuid, text, bigint, uuid, uuid[], date, text, bigint[], uuid[]) from public, anon, authenticated;
 revoke all on function public.create_ledger(text, text[]) from public, anon, authenticated;
 revoke all on function public.get_ledger(text) from public, anon, authenticated;
+revoke all on function public.get_history(text) from public, anon, authenticated;
+revoke all on function public.restore_entry(text, uuid) from public, anon, authenticated;
 revoke all on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[]) from public, anon, authenticated;
 revoke all on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[]) from public, anon, authenticated;
 revoke all on function public.delete_entry(text, uuid) from public, anon, authenticated;
@@ -354,6 +437,8 @@ revoke all on function public.rename_member(text, uuid, text) from public, anon,
 revoke all on function public.leave_member(text, uuid) from public, anon, authenticated;
 grant execute on function public.create_ledger(text, text[]) to anon, authenticated;
 grant execute on function public.get_ledger(text) to anon, authenticated;
+grant execute on function public.get_history(text) to anon, authenticated;
+grant execute on function public.restore_entry(text, uuid) to anon, authenticated;
 grant execute on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
 grant execute on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
 grant execute on function public.delete_entry(text, uuid) to anon, authenticated;

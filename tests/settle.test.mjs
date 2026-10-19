@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName } from '../site/js/settle.js';
+import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName, describeActivity } from '../site/js/settle.js';
 
 test('parseAmount 接受合法金额', () => {
   assert.equal(parseAmount('12'), 1200);
@@ -177,4 +177,20 @@ test('validateMemberName', () => {
   assert.equal(validateMemberName('   ').ok, false);
   assert.equal(validateMemberName('x'.repeat(21)).ok, false);
   assert.equal(validateMemberName('小李', ['小李']).error, '已有同名成员');
+});
+
+test('describeActivity：各类操作的描述，未知类型不报错', () => {
+  assert.equal(describeActivity({ action: 'create', detail: { name: '502', members: ['a', 'b'] } }), '创建账本「502」，成员：a、b');
+  assert.equal(describeActivity({ action: 'add_entry', detail: { kind: 'expense', title: '电费', amount: 18640 } }), '记一笔「电费」¥186.40');
+  assert.equal(describeActivity({ action: 'add_entry', detail: { kind: 'transfer', title: '结算转账', amount: 100 } }), '记录还款 ¥1.00');
+  assert.equal(describeActivity({ action: 'update_entry', detail: { title: 'b', amount: 200, oldTitle: 'a', oldAmount: 100 } }), '编辑「a」→「b」 ¥1.00 → ¥2.00');
+  assert.equal(describeActivity({ action: 'update_entry', detail: { title: 'a', amount: 100, oldTitle: 'a', oldAmount: 100 } }), '编辑「a」');
+  assert.equal(describeActivity({ action: 'delete_entry', detail: { kind: 'transfer', title: '结算转账', amount: 100 } }), '删除还款「结算转账」¥1.00');
+  assert.equal(describeActivity({ action: 'restore_entry', detail: { kind: 'expense', title: 'x', amount: 1 } }), '恢复「x」¥0.01');
+  assert.equal(describeActivity({ action: 'rename_member', detail: { name: 'B', oldName: 'A' } }), 'A 改名为 B');
+  assert.equal(describeActivity({ action: 'leave_member', detail: { name: 'C' } }), 'C退出账本');
+  assert.equal(describeActivity({ action: 'restore_member', detail: { name: 'C' } }), 'C重新加入');
+  assert.equal(describeActivity({ action: 'add_member', detail: { name: 'D' } }), '添加成员D');
+  assert.equal(describeActivity({ action: 'future_thing', detail: {} }), '其他操作');
+  assert.equal(describeActivity(null), '其他操作');
 });
