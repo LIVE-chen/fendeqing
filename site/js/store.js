@@ -42,6 +42,8 @@ const cloud = {
   addEntry: (token, e) => rpc('add_entry', {
     p_token: token, p_kind: e.kind, p_title: e.title, p_amount: e.amount,
     p_payer: e.payerId, p_participants: e.participantIds, p_spent_on: e.spentOn,
+    // 均摊时不传新参数：数据库尚未迁移时，最常用的均摊记账仍然可用
+    ...(e.splitMode && e.splitMode !== 'equal' ? { p_split_mode: e.splitMode, p_shares: e.shares } : {}),
   }),
   deleteEntry: (token, id) => rpc('delete_entry', { p_token: token, p_entry: id }),
 };
@@ -74,7 +76,8 @@ const local = {
     const d = readLocal(token);
     if (d.entries.length >= 2000) throw new StoreError('单个账本最多 2000 条记录');
     const id = uuid();
-    d.entries.unshift({ id, ...e, createdAt: new Date().toISOString() });
+    const splitMode = e.splitMode ?? 'equal';
+    d.entries.unshift({ id, ...e, splitMode, shares: splitMode === 'equal' ? null : e.shares, createdAt: new Date().toISOString() });
     d.entries.sort((a, b) => (b.spentOn + b.createdAt).localeCompare(a.spentOn + a.createdAt));
     writeLocal(token, d);
     return id;

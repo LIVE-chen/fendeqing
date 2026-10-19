@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAmount, formatCents, splitEqual, computeBalances, minimizeTransfers, validateMembers } from '../site/js/settle.js';
+import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers } from '../site/js/settle.js';
 
 test('parseAmount 接受合法金额', () => {
   assert.equal(parseAmount('12'), 1200);
@@ -73,4 +73,75 @@ test('validateMembers', () => {
   assert.equal(validateMembers(['a', 'a']).ok, false);
   assert.equal(validateMembers(['a', 'x'.repeat(21)]).ok, false);
   assert.deepEqual(validateMembers([' 我 ', '', '小王']), { ok: true, names: ['我', '小王'] });
+});
+
+// ---------- #9 按比例 / 按金额分摊 ----------
+const sum = (xs) => xs.reduce((a, b) => a + b, 0);
+
+test('splitByWeights：权重全为 1 时与 splitEqual 一致', () => {
+  for (const [amt, n] of [[1000, 3], [1, 4], [99999, 7], [5, 5]]) {
+    assert.deepEqual(splitByWeights(amt, Array(n).fill(1)), splitEqual(amt, n));
+  }
+});
+
+test('splitByWeights：按比例，总和守恒，最大余数法', () => {
+  assert.deepEqual(splitByWeights(10000, [2, 1]), [6667, 3333]);
+  assert.deepEqual(splitByWeights(100, [1, 1, 1]), [34, 33, 33]);
+  assert.deepEqual(splitByWeights(1000, [1, 2, 3, 4]), [100, 200, 300, 400]);
+  // 余数大的人优先补 1 分：10 × [1,1,3]/5 = [2,2,6] 整除；7 × [1,1,3]/5 = [1.4,1.4,4.2] → [2,1,4]
+  assert.deepEqual(splitByWeights(7, [1, 1, 3]), [2, 1, 4]);
+});
+
+test('splitByWeights：按金额时恰好还原每人金额，且大数不丢精度', () => {
+  assert.deepEqual(splitByWeights(10000, [3000, 7000]), [3000, 7000]);
+  const big = [999_999_999, 1];
+  assert.deepEqual(splitByWeights(1_000_000_000, big), big);
+});
+
+test('splitByWeights：随机数据总和恒等于金额，每人与理论值相差 < 1 分', () => {
+  let seed = 7;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed % n; };
+  for (let k = 0; k < 500; k++) {
+    const w = Array.from({ length: 1 + rnd(20) }, () => 1 + rnd(1000));
+    const amt = 1 + rnd(1_000_000_000);
+    const r = splitByWeights(amt, w);
+    assert.equal(sum(r), amt);
+    const W = sum(w);
+    r.forEach((c, i) => assert.ok(Math.abs(c - (amt * w[i]) / W) < 1));
+  }
+});
+
+test('computeBalances 支持按比例 / 按金额，余额之和为 0', () => {
+  const bal = computeBalances(members, [
+    { payerId: 'a', amount: 9000, participantIds: ['b', 'c'], splitMode: 'ratio', shares: [2, 1] },
+    { payerId: 'b', amount: 1000, participantIds: ['a', 'c'], splitMode: 'amount', shares: [100, 900] },
+  ]);
+  assert.deepEqual([...bal], [['a', 9000 - 100], ['b', 1000 - 6000], ['c', -3000 - 900]]);
+  assert.equal(sum([...bal.values()]), 0);
+});
+
+test('entryShares：参与人顺序与成员顺序不同时，份额跟着人走', () => {
+  const e = { amount: 400, participantIds: ['c', 'a'], splitMode: 'amount', shares: [300, 100] };
+  assert.deepEqual(entryShares(members, e), [['a', 100], ['c', 300]]);
+});
+
+test('entryShares：份额数据缺失或长度不符时退回均摊', () => {
+  assert.deepEqual(entryShares(members, { amount: 100, participantIds: ['a', 'b'], splitMode: 'ratio', shares: [1] }), [['a', 50], ['b', 50]]);
+  assert.deepEqual(entryShares(members, { amount: 100, participantIds: ['a', 'b'] }), [['a', 50], ['b', 50]]);
+});
+
+test('entryShares：有参与人已不在账本时，剩下的人按原权重分摊全额', () => {
+  const r = entryShares(members, { amount: 900, participantIds: ['a', 'gone', 'b'], splitMode: 'ratio', shares: [1, 5, 2] });
+  assert.deepEqual(r, [['a', 300], ['b', 600]]);
+});
+
+test('parseSplit', () => {
+  assert.deepEqual(parseSplit('equal', 100, []), { ok: true, shares: null });
+  assert.deepEqual(parseSplit('ratio', 100, ['2', ' 1 ']), { ok: true, shares: [2, 1] });
+  for (const bad of [['0'], ['1.5'], ['1001'], [''], ['abc']]) assert.equal(parseSplit('ratio', 100, bad).ok, false, bad[0]);
+  assert.deepEqual(parseSplit('amount', 10000, ['30', '70']), { ok: true, shares: [3000, 7000] });
+  assert.match(parseSplit('amount', 10000, ['30', '60']).error, /还差 ¥10\.00/);
+  assert.match(parseSplit('amount', 10000, ['50', '60']).error, /多了 ¥10\.00/);
+  assert.equal(parseSplit('amount', 10000, ['100', '0']).ok, false);
+  assert.equal(parseSplit('hack', 100, ['1']).ok, false);
 });
