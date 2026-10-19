@@ -153,6 +153,32 @@ await page.locator('.entries li').first().locator('.icon-btn').click();
 await page.waitForFunction((k) => document.querySelectorAll('.entries li').length === k - 1, before, { timeout: 15000 });
 ok(true, '删除记录成功');
 
+// #14 软删除：toast 里撤销；历史里看到删除记录和操作记录，并能恢复
+const busyIdle = () => page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
+await page.locator('#toast .toast-action', { hasText: '撤销' }).click();
+await page.waitForFunction((k) => document.querySelectorAll('.entries li').length === k, before, { timeout: 15000 });
+ok(true, '删除后点"撤销"恢复记录');
+const firstTitle = (await page.locator('.entries li .entry-title').first().textContent()).replace('还款', '').trim();
+await page.locator('.entries li').first().locator('.icon-btn').click();
+await page.waitForFunction((k) => document.querySelectorAll('.entries li').length === k - 1, before, { timeout: 15000 });
+await busyIdle();
+await page.click('#open-history');
+await page.waitForSelector('#history-deleted button');
+ok((await page.textContent('#history-deleted')).includes(firstTitle), '历史：最近删除里能看到刚删的记录');
+const logText = await page.textContent('#history-log');
+ok(logText.includes('删除') && logText.includes('恢复') && logText.includes('创建账本「502 合租」'), '历史：操作记录包含创建、删除、恢复');
+await hideToast();
+await page.screenshot({ path: shots + '9-history.png' });
+await page.locator('#history-deleted button').first().click();
+await page.waitForFunction(() => !document.querySelector('#history-deleted button'), null, { timeout: 15000 });
+await busyIdle();
+ok(await page.locator('.entries li').count() === before, '历史：从最近删除里恢复记录');
+await page.click('#history-close');
+// 回到删除后的状态，后续用例不受影响
+await page.locator('.entries li').first().locator('.icon-btn').click();
+await page.waitForFunction((k) => document.querySelectorAll('.entries li').length === k - 1, before, { timeout: 15000 });
+await busyIdle();
+
 // 跨设备同步：全新的浏览器上下文（不共享 localStorage），打开同一链接并记一笔
 const isCloudMode = (await page.textContent('#mode-badge')).includes('云端');
 if (isCloudMode) {

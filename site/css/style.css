@@ -136,6 +136,15 @@ dialog::backdrop { background: rgba(20, 30, 28, .45); }
   max-width: calc(100vw - 32px); padding: 10px 16px; border-radius: 10px; background: #1f2a28; color: #fff; font-size: 14px;
 }
 .toast.error { background: var(--danger); }
+.toast:not([hidden]) { display: flex; align-items: center; gap: 12px; }
+.toast-action { flex: none; min-height: 32px; padding: 0 12px; border: 1px solid rgba(255,255,255,.5); border-radius: 8px; background: transparent; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+
+/* 历史 */
+#history-dialog h3 { font-size: 15px; margin: 18px 0 0; }
+.history { margin-top: 6px; }
+.history.log li { padding: 8px 0; font-size: 14px; }
+.history .log-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.history time { flex: none; }
 
 @media (max-width: 380px) {
   .steps { grid-template-columns: 1fr; }

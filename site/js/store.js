@@ -51,6 +51,8 @@ const cloud = {
     p_split_mode: e.splitMode ?? 'equal', p_shares: e.splitMode && e.splitMode !== 'equal' ? e.shares : null,
   }),
   deleteEntry: (token, id) => rpc('delete_entry', { p_token: token, p_entry: id }),
+  restoreEntry: (token, id) => rpc('restore_entry', { p_token: token, p_entry: id }),
+  getHistory: (token) => rpc('get_history', { p_token: token }),
   addMember: (token, name) => rpc('add_member', { p_token: token, p_name: name }),
   renameMember: (token, id, name) => rpc('rename_member', { p_token: token, p_member: id, p_name: name }),
   leaveMember: (token, id) => rpc('leave_member', { p_token: token, p_member: id }),
@@ -73,16 +75,32 @@ function writeLocal(token, data) {
   catch { throw new StoreError('浏览器存储空间不足，保存失败'); }
 }
 
+// 本地模式的规则与服务端函数保持一致（软删除、回收站上限、操作日志）
+const now = () => new Date().toISOString();
+const byDate = (a, b) => (b.spentOn + b.createdAt).localeCompare(a.spentOn + a.createdAt);
+function log(d, action, detail) {
+  d.activities = [{ at: now(), action, detail }, ...(d.activities ?? [])].slice(0, 500);
+}
 const local = {
   async createLedger(name, members) {
     const token = randomHex(16);
-    writeLocal(token, { name, members: members.map((n) => ({ id: uuid(), name: n })), entries: [] });
+    const d = { name, members: members.map((n) => ({ id: uuid(), name: n })), entries: [], deleted: [], activities: [] };
+    log(d, 'create', { name, members });
+    writeLocal(token, d);
     return token;
   },
   async getLedger(token) {
     const d = readLocal(token);
-    d.members = d.members.map((m) => ({ ...m, left: Boolean(m.left) })); // 旧数据没有 left 字段
-    return d;
+    // 旧数据没有 left / deleted / activities 字段
+    return { name: d.name, members: d.members.map((m) => ({ ...m, left: Boolean(m.left) })), entries: d.entries };
+  },
+  async getHistory(token) {
+    const d = readLocal(token);
+    const cutoff = Date.now() - 30 * 86400_000;
+    return {
+      deleted: (d.deleted ?? []).filter((e) => Date.parse(e.deletedAt) >= cutoff).slice(0, 100),
+      activities: (d.activities ?? []).slice(0, 100),
+    };
   },
   async addEntry(token, e) {
     const d = readLocal(token);
@@ -90,17 +108,34 @@ const local = {
     if (e.kind === 'expense') checkActive(d, e, []);
     const id = uuid();
     const splitMode = e.splitMode ?? 'equal';
-    d.entries.unshift({ id, ...e, splitMode, shares: splitMode === 'equal' ? null : e.shares, createdAt: new Date().toISOString() });
-    d.entries.sort((a, b) => (b.spentOn + b.createdAt).localeCompare(a.spentOn + a.createdAt));
+    d.entries.unshift({ id, ...e, splitMode, shares: splitMode === 'equal' ? null : e.shares, createdAt: now() });
+    d.entries.sort(byDate);
+    log(d, 'add_entry', { kind: e.kind, title: e.title, amount: e.amount });
     writeLocal(token, d);
     return id;
   },
   async deleteEntry(token, id) {
     const d = readLocal(token);
-    d.entries = d.entries.filter((x) => x.id !== id);
+    const e = d.entries.find((x) => x.id === id);
+    if (!e) throw new StoreError('记录不存在');
+    d.entries = d.entries.filter((x) => x !== e);
+    const cutoff = Date.now() - 30 * 86400_000;
+    d.deleted = [{ ...e, deletedAt: now() }, ...(d.deleted ?? [])].filter((x) => Date.parse(x.deletedAt) >= cutoff).slice(0, 100);
+    log(d, 'delete_entry', { kind: e.kind, title: e.title, amount: e.amount });
     writeLocal(token, d);
   },
-  // 以下规则与服务端 update_entry / add_member / rename_member / leave_member 保持一致
+  async restoreEntry(token, id) {
+    const d = readLocal(token);
+    const e = (d.deleted ?? []).find((x) => x.id === id);
+    if (!e) throw new StoreError('记录不存在或已恢复');
+    if (d.entries.length >= 2000) throw new StoreError('单个账本最多 2000 条记录');
+    d.deleted = d.deleted.filter((x) => x !== e);
+    const { deletedAt, ...rest } = e;
+    d.entries.push(rest);
+    d.entries.sort(byDate);
+    log(d, 'restore_entry', { kind: e.kind, title: e.title, amount: e.amount });
+    writeLocal(token, d);
+  },
   async updateEntry(token, id, e) {
     const d = readLocal(token);
     const old = d.entries.find((x) => x.id === id);
@@ -108,11 +143,12 @@ const local = {
     if (old.kind !== 'expense') throw new StoreError('还款记录不能编辑，可以删除后重新标记');
     checkActive(d, e, [...old.participantIds, old.payerId]);
     const splitMode = e.splitMode ?? 'equal';
+    log(d, 'update_entry', { title: e.title, amount: e.amount, oldTitle: old.title, oldAmount: old.amount });
     Object.assign(old, {
       title: e.title, amount: e.amount, payerId: e.payerId, participantIds: e.participantIds, spentOn: e.spentOn,
-      splitMode, shares: splitMode === 'equal' ? null : e.shares, updatedAt: new Date().toISOString(),
+      splitMode, shares: splitMode === 'equal' ? null : e.shares, updatedAt: now(),
     });
-    d.entries.sort((a, b) => (b.spentOn + b.createdAt).localeCompare(a.spentOn + a.createdAt));
+    d.entries.sort(byDate);
     writeLocal(token, d);
   },
   async addMember(token, name) {
@@ -120,10 +156,11 @@ const local = {
     const same = d.members.find((m) => m.name === name);
     if (same && !same.left) throw new StoreError('已有同名成员');
     if (d.members.filter((m) => !m.left).length >= 20) throw new StoreError('最多 20 位成员');
-    if (same) { same.left = false; writeLocal(token, d); return same.id; }
+    if (same) { same.left = false; log(d, 'restore_member', { name }); writeLocal(token, d); return same.id; }
     if (d.members.length >= 50) throw new StoreError('成员总数（含已退出）最多 50 位');
     const id = uuid();
     d.members.push({ id, name, left: false });
+    log(d, 'add_member', { name });
     writeLocal(token, d);
     return id;
   },
@@ -132,6 +169,7 @@ const local = {
     const m = d.members.find((x) => x.id === id);
     if (!m) throw new StoreError('成员不存在');
     if (d.members.some((x) => x.name === name && x.id !== id)) throw new StoreError('已有同名成员（含已退出的成员）');
+    log(d, 'rename_member', { name, oldName: m.name });
     m.name = name;
     writeLocal(token, d);
   },
@@ -141,6 +179,7 @@ const local = {
     if (!m) throw new StoreError('成员不存在或已退出');
     if (d.members.filter((x) => !x.left).length <= 2) throw new StoreError('账本至少需要 2 位成员');
     m.left = true;
+    log(d, 'leave_member', { name: m.name });
     writeLocal(token, d);
   },
 };

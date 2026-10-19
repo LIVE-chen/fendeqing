@@ -19,13 +19,20 @@ export function h(tag, attrs = {}, ...children) {
 export const $ = (s) => document.querySelector(s);
 
 let toastTimer;
-export function toast(msg, isError = false) {
+/** action: { label, onClick } 时在提示里放一个按钮（例如"撤销"），显示时间延长到 6 秒 */
+export function toast(msg, isError = false, action = null) {
   const t = $('#toast');
-  t.textContent = msg;
+  t.replaceChildren(h('span', {}, msg));
+  if (action) {
+    t.append(h('button', {
+      type: 'button', class: 'toast-action',
+      onclick: () => { t.hidden = true; clearTimeout(toastTimer); action.onClick(); },
+    }, action.label));
+  }
   t.classList.toggle('error', isError);
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 2600);
+  toastTimer = setTimeout(() => { t.hidden = true; }, action ? 6000 : 2600);
 }
 
 export const errMsg = (e) => (e instanceof StoreError ? e.message : '出了点问题，请刷新后重试');
