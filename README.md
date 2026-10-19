@@ -6,7 +6,7 @@
 
 ```bash
 npm run dev                      # http://localhost:5173
-npm test                         # 结算算法单元测试（无外部依赖）
+npm test                         # 结算算法、统计与 xlsx 导出单元测试（无外部依赖）
 # 以下两项需要 NODE_PATH 指向含 playwright-core 和 @electric-sql/pglite 的 node_modules
 NODE_PATH=... npm run test:sql   # 在 PGlite 里跑 schema.sql 和 migrations/
 NODE_PATH=... npm run test:e2e -- [线上地址]   # 端到端测试 + 截图；不带地址时用本机模式，E2E_CLOUD=1 则连云端

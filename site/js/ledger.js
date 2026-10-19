@@ -2,6 +2,8 @@ import {
   parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares,
   centsToInput, canLeave, isActive, validateMemberName, describeActivity,
 } from './settle.js';
+import { monthlyTotals, memberStats, barPercents, ledgerSheets, exportFileName } from './stats.js';
+import { buildXlsx } from './xlsx.js';
 import { store, isCloud, rememberLedger } from './store.js';
 import { h, $, toast, errMsg, today, withBusy } from './ui.js';
 
@@ -109,7 +111,56 @@ function paint(root) {
         })));
 
   const fab = h('button', { class: 'fab', onclick: () => openEntryDialog(root) }, '+ 记一笔');
-  root.replaceChildren(header, settle, balanceList, entryList, fab);
+  root.replaceChildren(header, settle, balanceList, statsCard(), entryList, fab);
+}
+
+// ---------- 统计与导出 ----------
+/** 条形图：配文字数值，读屏软件读到的是文字而不是图形 */
+function bars(rows, cls = '') {
+  const pct = barPercents(rows.map((r) => r.value));
+  return h('ul', { class: `bars ${cls}` }, rows.map((r, i) => {
+    const fill = h('span', { class: 'bar-fill' });
+    fill.style.width = `${pct[i]}%`; // 用 CSSOM 设置：站点 CSP 禁止内联 style 属性，但允许脚本改样式
+    return h('li', {},
+      h('span', { class: 'bar-label' }, r.label),
+      h('span', { class: 'bar-track', 'aria-hidden': 'true' }, fill),
+      h('span', { class: 'amount small' }, formatCents(r.value)));
+  }));
+}
+
+function statsCard() {
+  const months = monthlyTotals(state.entries);
+  const per = memberStats(state.members, state.entries);
+  const label = (s) => (s.left ? `${s.name}（已退出）` : s.name);
+  return h('section', { class: 'card', id: 'stats' },
+    h('div', { class: 'card-head' }, h('h2', {}, '统计'),
+      h('button', { class: 'btn small', id: 'export-xlsx', onclick: (ev) => exportXlsx(ev.currentTarget) }, '导出 Excel')),
+    months.length === 0
+      ? h('p', { class: 'muted' }, '记几笔支出后，这里会显示每月花销和每人实际消费。')
+      : [
+          h('h3', {}, '每月支出'),
+          bars(months.slice(0, 12).map((m) => ({ label: m.month, value: m.total }))),
+          months.length > 12 ? h('p', { class: 'hint' }, `只显示最近 12 个月，完整数据请导出 Excel`) : null,
+          h('h3', {}, '每人实际消费'),
+          h('p', { class: 'hint' }, '按分摊算出的每人花销，不含还款。'),
+          bars(per.map((s) => ({ label: label(s), value: s.share })), 'per-member'),
+        ]);
+}
+
+function exportXlsx(btn) {
+  withBusy(btn, async () => {
+    try {
+      const data = await store.getLedger(state.token); // 导出最新数据
+      const bytes = buildXlsx(ledgerSheets(data));
+      const url = URL.createObjectURL(new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+      const a = h('a', { href: url, download: exportFileName(data.name, today()) });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      toast('已导出 Excel');
+    } catch (e) { console.error('[export]', e); toast(errMsg(e), true); }
+  });
 }
 
 async function copyLink(url) {
