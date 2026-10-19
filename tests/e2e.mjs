@@ -236,6 +236,75 @@ await page.keyboard.press('Escape');
 await hideToast();
 await page.screenshot({ path: shots + '6-split-ledger.png', fullPage: true });
 
+// #10 编辑支出：回填全部字段，改总额与每人金额
+const busyDone = () => page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
+await page.getByRole('button', { name: '编辑 晚饭（小王只喝饮料）' }).click();
+ok(await page.textContent('#entry-dialog-title') === '编辑记录', '点击支出打开编辑弹窗');
+ok(await page.inputValue('input[name=amount]') === '100.00' && await page.inputValue('select[name=payer]') !== ''
+  && await page.locator('input[name=splitMode][value=amount]').isChecked(), '编辑：金额、付款人、分摊方式已回填');
+ok(await share(0).inputValue() === '30.00' && await share(1).inputValue() === '70.00', '编辑：每人金额已回填');
+ok(!(await page.locator('input[name=participant]').nth(0).isChecked()), '编辑：未参与的成员保持未勾选');
+await page.fill('input[name=amount]', '120');
+await share(0).fill('50');
+ok((await page.textContent('#split-preview')).includes('金额已对上'), '编辑：修改后实时校验');
+await hideToast();
+await page.screenshot({ path: shots + '8-edit.png' });
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await busyDone();
+// 我 +100，小王 -150，小李 +50
+const bal2 = await page.textContent('#balances');
+ok(bal2.includes('小王应付 ¥150.00') && bal2.includes('小李应收 ¥50.00'), '编辑后余额重新计算');
+ok((await page.locator('.entries li', { hasText: '晚饭' }).textContent()).includes('已编辑'), '编辑过的记录显示"已编辑"');
+await page.click('.fab');
+ok(await page.textContent('#entry-dialog-title') === '记一笔' && await page.inputValue('input[name=amount]') === '', '编辑后再记一笔：表单恢复为新建状态');
+await page.keyboard.press('Escape');
+
+// 还款不能编辑：标记一笔已还，还款行没有编辑按钮
+await page.locator('.transfer button').first().click();
+await page.waitForSelector('.entries .tag:text("还款")');
+await busyDone();
+ok(await page.locator('.entries li', { hasText: '结算转账' }).locator('.entry-edit').count() === 0, '还款记录没有编辑入口');
+
+// #10 成员管理：添加、余额未结清不能退出、退出、恢复、改名
+await page.click('#open-members');
+await page.fill('#member-add-form input[name=name]', '小张');
+await page.click('#member-add');
+await page.waitForSelector('#members-list li:has-text("小张")');
+ok((await page.textContent('.ledger-head')).includes('4 人'), '添加成员后人数变为 4');
+await page.getByRole('button', { name: '小王退出账本' }).click();
+await page.waitForFunction(() => document.querySelector('#members-error').textContent.includes('未结清'));
+ok(true, '余额未结清的成员不能退出');
+await page.getByRole('button', { name: '小张退出账本' }).click();
+await page.waitForSelector('#members-list li:has-text("小张") .muted-tag');
+ok((await page.textContent('.ledger-head')).includes('3 人') && !(await page.textContent('#balances')).includes('小张'), '退出后人数减 1，余额列表不再显示');
+await page.getByRole('button', { name: '给小李改名' }).click();
+await page.fill('#members-list .rename-form input', '小王');
+await page.click('#members-list .rename-form button[type=submit]');
+ok((await page.textContent('#members-error')).includes('同名'), '改名为已有名字时报错');
+await page.fill('#members-list .rename-form input', '李雷');
+await page.click('#members-list .rename-form button[type=submit]');
+await page.waitForSelector('#members-list li:has-text("李雷")');
+await busyDone();
+ok((await page.textContent('.entries')).includes('李雷') && !(await page.textContent('.entries')).includes('小李'), '改名后历史流水同步显示新名字');
+ok((await page.textContent('#members-error')) === '', '改名成功后旧报错清除');
+await hideToast();
+await page.screenshot({ path: shots + '7-members.png' });
+await page.click('#members-close');
+await page.click('.fab');
+ok(!(await page.textContent('#participants')).includes('小张')
+  && !(await page.locator('select[name=payer] option', { hasText: '小张' }).count()), '记一笔不再列出已退出成员');
+await page.keyboard.press('Escape');
+await page.click('#open-members');
+await page.getByRole('button', { name: '恢复小张' }).click();
+await page.waitForFunction(() => !document.querySelector('#members-list li .muted-tag'));
+await busyDone();
+ok((await page.textContent('.ledger-head')).includes('4 人'), '恢复已退出成员');
+await page.click('#members-close');
+await page.reload();
+await page.waitForSelector('.entries');
+ok((await page.textContent('#balances')).includes('李雷') && (await page.textContent('.ledger-head')).includes('4 人'), '刷新后成员变更仍然保留');
+
 // 无效链接
 await page.goto(base + '#/l/abc');
 ok(await page.isVisible('text=链接无效'), '无效链接有友好提示');

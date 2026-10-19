@@ -107,6 +107,21 @@ legend { font-size: 14px; color: var(--muted); padding: 0; display: flex; gap: 1
 .share-row input { width: 120px; flex: none; margin: 0; text-align: right; }
 .hint.warn { color: var(--danger); }
 
+/* 支出记录整块可点击编辑 */
+.entry-edit { display: block; text-align: left; background: none; border: 0; padding: 4px 6px; margin: -4px -6px; border-radius: 10px; font: inherit; color: inherit; cursor: pointer; }
+.entry-edit:hover { background: #f3f7f6; }
+.entry-edit:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.tag.muted-tag { background: #eef1f0; color: var(--muted); margin: 0 0 0 6px; }
+
+/* 成员管理 */
+.members { margin-top: 12px; }
+.member-row { flex-wrap: wrap; }
+.member-row .member-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.member-row .actions { margin: 0; gap: 6px; }
+.rename-form, .member-add { display: flex; gap: 8px; align-items: center; width: 100%; }
+.rename-form input, .member-add input { flex: 1; min-width: 0; margin: 0; }
+.member-add { margin-top: 12px; }
+
 .fab {
   position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(20px + env(safe-area-inset-bottom));
   min-height: 52px; padding: 0 28px; border: 0; border-radius: 999px; background: var(--brand); color: #fff;

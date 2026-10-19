@@ -21,6 +21,11 @@ export function formatCents(cents) {
   return `${sign}¥${yuan}.${frac}`;
 }
 
+/** 分 → 输入框文本（编辑时回填）：1250 → "12.50"，不带千分位，parseAmount 可原样解析 */
+export function centsToInput(cents) {
+  return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')}`;
+}
+
 /** 把 amount 均分成 n 份，余下的分依次分给前面的人，保证总和不变 */
 export function splitEqual(amount, n) {
   if (n <= 0) return [];
@@ -133,6 +138,30 @@ export function parseSplit(mode, amount, inputs) {
     return { ok: true, shares };
   }
   return { ok: false, error: '分摊方式不合法' };
+}
+
+export const isActive = (m) => !m.left;
+
+/**
+ * 能否退出账本：成员在账、退出后在账仍不少于 2 人、余额已结清。
+ * 余额只在前端判断（结算算法只有 settle.js 这一份），服务端只兜底人数。
+ */
+export function canLeave(members, balances, id) {
+  const m = members.find((x) => x.id === id);
+  if (!m || !isActive(m)) return { ok: false, error: '成员不存在或已退出' };
+  if (members.filter(isActive).length <= 2) return { ok: false, error: '账本至少需要 2 位成员' };
+  const v = balances.get(id) ?? 0;
+  if (v !== 0) return { ok: false, error: `${m.name}还有${v > 0 ? '应收' : '应付'} ${formatCents(Math.abs(v))} 未结清，结清后才能退出` };
+  return { ok: true };
+}
+
+/** 校验单个成员名字：1~20 字，不与 others 重复 */
+export function validateMemberName(name, others = []) {
+  const n = String(name ?? '').trim();
+  if (!n) return { ok: false, error: '请填写名字' };
+  if (n.length > 20) return { ok: false, error: '成员名字最多 20 个字' };
+  if (others.includes(n)) return { ok: false, error: '已有同名成员' };
+  return { ok: true, name: n };
 }
 
 /** 校验成员名单：2~20 人，每个名字 1~20 字，不能重复 */

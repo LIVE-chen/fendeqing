@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers } from '../site/js/settle.js';
+import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName } from '../site/js/settle.js';
 
 test('parseAmount 接受合法金额', () => {
   assert.equal(parseAmount('12'), 1200);
@@ -144,4 +144,37 @@ test('parseSplit', () => {
   assert.match(parseSplit('amount', 10000, ['50', '60']).error, /多了 ¥10\.00/);
   assert.equal(parseSplit('amount', 10000, ['100', '0']).ok, false);
   assert.equal(parseSplit('hack', 100, ['1']).ok, false);
+});
+
+test('centsToInput 与 parseAmount 互逆', () => {
+  assert.equal(centsToInput(1250), '12.50');
+  assert.equal(centsToInput(5), '0.05');
+  assert.equal(centsToInput(123456789), '1234567.89'); // 不带千分位
+  for (const c of [1, 99, 100, 10001, 1_000_000_000]) assert.equal(parseAmount(centsToInput(c)), c);
+});
+
+test('退出成员仍参与余额计算，历史记录不变', () => {
+  const members = [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }, { id: 'c', name: 'C', left: true }];
+  const bal = computeBalances(members, [{ payerId: 'c', amount: 300, participantIds: ['a', 'b', 'c'] }]);
+  assert.deepEqual([...bal], [['a', -100], ['b', -100], ['c', 200]]);
+  const tr = minimizeTransfers(bal);
+  assert.ok(tr.every((t) => t.to === 'c'));
+});
+
+test('canLeave：需在账、退出后不少于 2 人、余额为 0', () => {
+  const m = [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }, { id: 'c', name: 'C' }, { id: 'd', name: 'D', left: true }];
+  const zero = new Map(m.map((x) => [x.id, 0]));
+  assert.equal(canLeave(m, zero, 'a').ok, true);
+  assert.match(canLeave(m, new Map([['a', 150]]), 'a').error, /A还有应收 ¥1\.50 未结清/);
+  assert.match(canLeave(m, new Map([['a', -1]]), 'a').error, /应付 ¥0\.01/);
+  assert.match(canLeave(m, zero, 'd').error, /已退出/);
+  assert.match(canLeave(m, zero, 'x').error, /不存在/);
+  assert.match(canLeave(m.filter((x) => x.id !== 'c'), zero, 'a').error, /至少需要 2 位/);
+});
+
+test('validateMemberName', () => {
+  assert.deepEqual(validateMemberName('  小王 ', ['小李']), { ok: true, name: '小王' });
+  assert.equal(validateMemberName('   ').ok, false);
+  assert.equal(validateMemberName('x'.repeat(21)).ok, false);
+  assert.equal(validateMemberName('小李', ['小李']).error, '已有同名成员');
 });

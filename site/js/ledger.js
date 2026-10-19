@@ -1,4 +1,7 @@
-import { parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares } from './settle.js';
+import {
+  parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares,
+  centsToInput, canLeave, isActive, validateMemberName,
+} from './settle.js';
 import { store, isCloud, rememberLedger } from './store.js';
 import { h, $, toast, errMsg, today, withBusy } from './ui.js';
 
@@ -32,7 +35,14 @@ export async function renderLedger(root, token, { quiet = false } = {}) {
   }
 }
 
-const nameOf = (id) => state.members.find((m) => m.id === id)?.name ?? '已删除成员';
+const memberOf = (id) => state.members.find((m) => m.id === id);
+const nameOf = (id) => memberOf(id)?.name ?? '已删除成员';
+const active = () => state.members.filter(isActive);
+/** 参与人恰好是全部在账成员时显示"全员" */
+const isEveryone = (ids) => {
+  const a = active();
+  return ids.length === a.length && a.every((m) => ids.includes(m.id));
+};
 
 function paint(root) {
   document.title = `${state.name} · 分得清`;
@@ -45,9 +55,10 @@ function paint(root) {
   const header = h('section', { class: 'card ledger-head' },
     h('div', {},
       h('h1', {}, state.name),
-      h('p', { class: 'muted' }, `${state.members.length} 人 · 共 ${expenses.length} 笔支出 · 合计 ${formatCents(total)}`)),
+      h('p', { class: 'muted' }, `${active().length} 人 · 共 ${expenses.length} 笔支出 · 合计 ${formatCents(total)}`)),
     h('div', { class: 'actions wrap' },
       h('button', { class: 'btn ghost', onclick: () => copyLink(shareUrl) }, isCloud ? '复制邀请链接' : '复制链接'),
+      h('button', { class: 'btn ghost', id: 'open-members', onclick: () => openMembersDialog(root) }, '成员'),
       h('button', { class: 'btn ghost', 'aria-label': '刷新账本', onclick: () => renderLedger(root, state.token) }, '刷新')));
 
   const settle = h('section', { class: 'card', id: 'settle' },
@@ -62,10 +73,11 @@ function paint(root) {
 
   const balanceList = h('section', { class: 'card', id: 'balances' },
     h('h2', {}, '每人余额'),
-    h('ul', { class: 'list' }, state.members.map((m) => {
+    // 已退出且已结清的成员不再显示；退出时余额必须为 0，但删除/编辑旧记录后可能重新出现余额
+    h('ul', { class: 'list' }, state.members.filter((m) => isActive(m) || (balances.get(m.id) ?? 0) !== 0).map((m) => {
       const v = balances.get(m.id) ?? 0;
       return h('li', {},
-        h('span', {}, m.name),
+        h('span', {}, m.name, isActive(m) ? null : h('span', { class: 'tag muted-tag' }, '已退出')),
         h('span', { class: `amount ${v > 0 ? 'pos' : v < 0 ? 'neg' : ''}` },
           v > 0 ? `应收 ${formatCents(v)}` : v < 0 ? `应付 ${formatCents(-v)}` : '已结清'));
     })));
@@ -79,14 +91,18 @@ function paint(root) {
           const weighted = e.splitMode === 'ratio' || e.splitMode === 'amount';
           const who = weighted
             ? entryShares(state.members, e).map(([id, c]) => `${nameOf(id)} ${formatCents(c)}`).join('、')
-            : `${e.participantIds.length === state.members.length ? '全员' : e.participantIds.map(nameOf).join('、')} 分摊`;
+            : `${isEveryone(e.participantIds) ? '全员' : e.participantIds.map(nameOf).join('、')} 分摊`;
           const sub = isT
             ? `${nameOf(e.payerId)} 还给 ${nameOf(e.participantIds[0])}`
             : `${nameOf(e.payerId)} 付款 · ${weighted ? (e.splitMode === 'ratio' ? '按比例：' : '按金额：') : ''}${who}`;
+          const body = [
+            h('div', { class: 'entry-title' }, isT ? h('span', { class: 'tag' }, '还款') : null, e.title,
+              e.updatedAt ? h('span', { class: 'tag muted-tag' }, '已编辑') : null),
+            h('div', { class: 'muted small' }, `${e.spentOn} · ${sub}`)];
+          // 支出整块可点击编辑；还款只能删除
           return h('li', {},
-            h('div', { class: 'entry-main' },
-              h('div', { class: 'entry-title' }, isT ? h('span', { class: 'tag' }, '还款') : null, e.title),
-              h('div', { class: 'muted small' }, `${e.spentOn} · ${sub}`)),
+            isT ? h('div', { class: 'entry-main' }, body)
+              : h('button', { type: 'button', class: 'entry-main entry-edit', 'aria-label': `编辑 ${e.title}`, onclick: () => openEntryDialog(root, e) }, body),
             h('span', { class: 'amount' }, formatCents(e.amount)),
             h('button', { class: 'icon-btn', 'aria-label': `删除 ${e.title}`, onclick: (ev) => removeEntry(root, ev.currentTarget, e) }, '×'));
         })));
@@ -143,19 +159,44 @@ const dialog = $('#entry-dialog');
 const form = $('#entry-form');
 const errEl = $('#entry-error');
 let currentRoot = null;
+let editing = null; // 正在编辑的支出；null 表示新记一笔
 
-function openEntryDialog(root) {
+/** entry 不为空时进入编辑模式，回填全部字段 */
+function openEntryDialog(root, entry = null) {
   currentRoot = root;
+  editing = entry;
   form.reset();
   errEl.textContent = '';
-  form.elements.spentOn.value = today();
+  $('#entry-dialog-title').textContent = entry ? '编辑记录' : '记一笔';
   form.elements.spentOn.max = today();
-  const payer = form.elements.payer;
-  payer.replaceChildren(...state.members.map((m) => h('option', { value: m.id }, m.name)));
-  $('#participants').replaceChildren(...state.members.map((m) =>
-    h('label', { class: 'chip' }, h('input', { type: 'checkbox', name: 'participant', value: m.id, checked: true }), m.name)));
+  // 只列在账成员；编辑时额外列出原记录里已退出的人，允许保留
+  const keepIds = entry ? [entry.payerId, ...entry.participantIds] : [];
+  const choices = state.members.filter((m) => isActive(m) || keepIds.includes(m.id));
+  const label = (m) => (isActive(m) ? m.name : `${m.name}（已退出）`);
+  form.elements.payer.replaceChildren(...choices.map((m) => h('option', { value: m.id }, label(m))));
+  const checked = new Set(entry ? entry.participantIds : choices.map((m) => m.id));
+  $('#participants').replaceChildren(...choices.map((m) =>
+    h('label', { class: 'chip' }, h('input', { type: 'checkbox', name: 'participant', value: m.id, checked: checked.has(m.id) }), label(m))));
   shareInputs.replaceChildren();
-  renderShareInputs();
+  if (entry) {
+    form.elements.title.value = entry.title;
+    form.elements.amount.value = centsToInput(entry.amount);
+    form.elements.payer.value = entry.payerId;
+    form.elements.spentOn.value = entry.spentOn;
+    const mode = entry.splitMode === 'ratio' || entry.splitMode === 'amount' ? entry.splitMode : 'equal';
+    form.querySelector(`input[name=splitMode][value=${mode}]`).checked = true;
+    renderShareInputs({ keep: false });
+    if (mode !== 'equal' && Array.isArray(entry.shares)) {
+      entry.participantIds.forEach((id, k) => {
+        const input = shareInputs.querySelector(`input[data-id="${id}"]`);
+        if (input) input.value = mode === 'amount' ? centsToInput(entry.shares[k]) : String(entry.shares[k]);
+      });
+      updatePreview();
+    }
+  } else {
+    form.elements.spentOn.value = today();
+    renderShareInputs();
+  }
   dialog.showModal();
   form.elements.title.focus();
 }
@@ -238,10 +279,115 @@ form.addEventListener('submit', (ev) => {
 
   withBusy($('#entry-submit'), async () => {
     try {
-      await store.addEntry(state.token, { kind: 'expense', title, amount, payerId, participantIds, spentOn, splitMode: mode, shares: split.shares });
+      const e = { kind: 'expense', title, amount, payerId, participantIds, spentOn, splitMode: mode, shares: split.shares };
+      if (editing) await store.updateEntry(state.token, editing.id, e);
+      else await store.addEntry(state.token, e);
       dialog.close();
-      toast(`已记录 ${formatCents(amount)}`);
+      toast(editing ? '已保存修改' : `已记录 ${formatCents(amount)}`);
       await renderLedger(currentRoot, state.token, { quiet: true });
     } catch (e) { errEl.textContent = errMsg(e); }
   });
 });
+
+// ---------- 成员管理弹窗 ----------
+const mDialog = $('#members-dialog');
+const mList = $('#members-list');
+const mErr = $('#members-error');
+const mAddForm = $('#member-add-form');
+let mRoot = null;
+
+function openMembersDialog(root) {
+  mRoot = root;
+  mErr.textContent = '';
+  mAddForm.reset();
+  renderMembers();
+  mDialog.showModal();
+}
+
+/** 操作成功后刷新账本，再重画成员列表（state 已更新） */
+async function afterMemberChange(msg) {
+  mErr.textContent = '';
+  toast(msg);
+  await renderLedger(mRoot, state.token, { quiet: true });
+  if (mDialog.open) renderMembers();
+}
+
+function renderMembers() {
+  const balances = computeBalances(state.members, state.entries);
+  const sorted = [...active(), ...state.members.filter((m) => !isActive(m))];
+  mList.replaceChildren(...sorted.map((m) => {
+    const name = h('span', { class: 'member-name' }, m.name, isActive(m) ? null : h('span', { class: 'tag muted-tag' }, '已退出'));
+    const actions = isActive(m)
+      ? [h('button', { type: 'button', class: 'btn small ghost', 'aria-label': `给${m.name}改名`, onclick: () => startRename(li, m) }, '改名'),
+         h('button', { type: 'button', class: 'btn small ghost', 'aria-label': `${m.name}退出账本`, onclick: (ev) => leave(ev.currentTarget, m.id) }, '退出')]
+      : [h('button', { type: 'button', class: 'btn small ghost', 'aria-label': `恢复${m.name}`, onclick: (ev) => restore(ev.currentTarget, m.name) }, '恢复')];
+    const v = balances.get(m.id) ?? 0;
+    const li = h('li', { class: 'member-row' }, name,
+      v ? h('span', { class: `amount small ${v > 0 ? 'pos' : 'neg'}` }, v > 0 ? `应收 ${formatCents(v)}` : `应付 ${formatCents(-v)}`) : null,
+      h('span', { class: 'actions' }, actions));
+    return li;
+  }));
+}
+
+function startRename(li, m) {
+  mErr.textContent = '';
+  const input = h('input', { value: m.name, maxlength: '20', 'aria-label': `${m.name}的新名字`, autocomplete: 'off' });
+  const save = h('button', { type: 'submit', class: 'btn small primary' }, '保存');
+  const f = h('form', { class: 'rename-form', novalidate: true }, input, save,
+    h('button', { type: 'button', class: 'btn small ghost', onclick: () => renderMembers() }, '取消'));
+  f.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const r = validateMemberName(input.value, state.members.filter((x) => x.id !== m.id).map((x) => x.name));
+    if (!r.ok) return void (mErr.textContent = r.error);
+    if (r.name === m.name) return renderMembers();
+    withBusy(save, async () => {
+      try { await store.renameMember(state.token, m.id, r.name); await afterMemberChange('已改名'); }
+      catch (e) { mErr.textContent = errMsg(e); }
+    });
+  });
+  li.replaceChildren(f);
+  input.focus();
+  input.select();
+}
+
+async function leave(btn, id) {
+  mErr.textContent = '';
+  await withBusy(btn, async () => {
+    try {
+      // 用最新数据判断是否已结清，避免别的设备刚记了一笔
+      const latest = await store.getLedger(state.token);
+      const r = canLeave(latest.members, computeBalances(latest.members, latest.entries), id);
+      if (!r.ok) { mErr.textContent = r.error; return; }
+      const name = latest.members.find((m) => m.id === id).name;
+      if (!confirm(`${name}退出账本？历史记录会保留，之后可以随时恢复。`)) return;
+      await store.leaveMember(state.token, id);
+      await afterMemberChange(`${name}已退出`);
+    } catch (e) { mErr.textContent = errMsg(e); }
+  });
+}
+
+async function restore(btn, name) {
+  mErr.textContent = '';
+  await withBusy(btn, async () => {
+    try { await store.addMember(state.token, name); await afterMemberChange(`${name}已恢复`); }
+    catch (e) { mErr.textContent = errMsg(e); }
+  });
+}
+
+mAddForm.addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  mErr.textContent = '';
+  // 与已退出成员同名属于"恢复"，允许；与在账成员同名才报错
+  const r = validateMemberName(mAddForm.elements.name.value, active().map((m) => m.name));
+  if (!r.ok) return void (mErr.textContent = r.error);
+  if (active().length >= 20) return void (mErr.textContent = '最多 20 位成员');
+  const revived = state.members.some((m) => m.name === r.name);
+  withBusy($('#member-add'), async () => {
+    try {
+      await store.addMember(state.token, r.name);
+      mAddForm.reset();
+      await afterMemberChange(revived ? `${r.name}已恢复` : `已添加${r.name}`);
+    } catch (e) { mErr.textContent = errMsg(e); }
+  });
+});
+$('#members-close').addEventListener('click', () => mDialog.close());

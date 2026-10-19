@@ -57,6 +57,22 @@
     </form>
   </dialog>
 
+  <dialog id="members-dialog" aria-labelledby="members-dialog-title">
+    <div class="dialog-body">
+      <h2 id="members-dialog-title">成员</h2>
+      <p class="hint">退出账本需要先结清余额；历史记录会保留，可以随时恢复。</p>
+      <ul id="members-list" class="list members"></ul>
+      <form id="member-add-form" class="member-add" novalidate>
+        <input name="name" maxlength="20" placeholder="新成员名字" aria-label="新成员名字" autocomplete="off" />
+        <button type="submit" class="btn primary small" id="member-add">添加</button>
+      </form>
+      <p class="form-error" id="members-error" role="alert"></p>
+      <div class="actions">
+        <button type="button" class="btn ghost" id="members-close">完成</button>
+      </div>
+    </div>
+  </dialog>
+
   <noscript><p class="card">需要开启 JavaScript 才能使用分得清。</p></noscript>
   <script type="module" src="./js/app.js"></script>
 </body>
