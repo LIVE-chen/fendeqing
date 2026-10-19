@@ -2,7 +2,7 @@
 // 运行：NODE_PATH=<workspace>/node_modules node tests/sql.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const pgliteDir = require.resolve('@electric-sql/pglite').replace(/dist[\\/].*$/, '');
@@ -79,10 +79,34 @@ test('服务端输入校验', async () => {
   await rejects(add('transfer', 100, [ids[0]]), /收款人/);
 });
 
+const setHeaders = (h) => db.exec(`set request.headers = '${JSON.stringify(h)}'`);
+const create = () => asAnon(`select public.create_ledger('r', array['x','y'])`);
+
 test('同一 IP 每小时最多创建 20 个账本', async () => {
-  await db.exec(`set request.headers = '{"x-forwarded-for":"9.9.9.9, 10.0.0.1"}'`);
-  for (let i = 0; i < 20; i++) await asAnon(`select public.create_ledger('r', array['x','y'])`);
-  await rejects(asAnon(`select public.create_ledger('r', array['x','y'])`), /太频繁/);
-  await db.exec(`set request.headers = '{"x-forwarded-for":"8.8.8.8"}'`);
-  await asAnon(`select public.create_ledger('r', array['x','y'])`);
+  await setHeaders({ 'cf-connecting-ip': '9.9.9.9', 'x-forwarded-for': '9.9.9.9' });
+  for (let i = 0; i < 20; i++) await create();
+  await rejects(create(), /太频繁/);
+  await setHeaders({ 'cf-connecting-ip': '8.8.8.8', 'x-forwarded-for': '8.8.8.8' });
+  await create();
+});
+
+test('伪造 x-forwarded-for 前缀无法绕过限流', async () => {
+  // 线上实测：客户端自带的 XFF 会被拼在前面，cf-connecting-ip 始终是真实地址
+  for (let i = 0; i < 20; i++) await setHeaders({ 'cf-connecting-ip': '7.7.7.7', 'x-forwarded-for': `1.1.1.${i}, 7.7.7.7` }), await create();
+  await setHeaders({ 'cf-connecting-ip': '7.7.7.7', 'x-forwarded-for': '6.6.6.6, 7.7.7.7' });
+  await rejects(create(), /太频繁/);
+  // 没有 cf-connecting-ip 时兜底取 XFF 最后一段
+  for (let i = 0; i < 20; i++) await setHeaders({ 'x-forwarded-for': `2.2.2.${i},5.5.5.5` }), await create();
+  await setHeaders({ 'x-forwarded-for': '3.3.3.3, 5.5.5.5' });
+  await rejects(create(), /太频繁/);
+});
+
+test('migrations/ 可叠加在 schema.sql 之上重复执行，权限不变', async () => {
+  const dir = new URL('../supabase/migrations/', import.meta.url);
+  const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
+  assert.ok(files.length > 0);
+  for (let round = 0; round < 2; round++) for (const f of files) await db.exec(await readFile(new URL(f, dir), 'utf8'));
+  await setHeaders({ 'cf-connecting-ip': '4.4.4.4' });
+  await create();
+  await rejects(asAnon(`select public._ledger_id('${'a'.repeat(32)}')`), /permission denied/);
 });
