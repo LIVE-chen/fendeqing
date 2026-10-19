@@ -270,13 +270,18 @@ ok(JSON.stringify(await barRows('#stats .per-member li')) === JSON.stringify(['�
   const strict = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const sp = await strict.newPage();
   const cspErr = [];
-  sp.on('console', (m) => { if (/Content Security Policy/.test(m.text()) && !/netlify/.test(m.location()?.url || '')) cspErr.push(m.text()); });
+  // Netlify 注入的工具条（/.netlify/scripts/* 和它的 srcdoc iframe）被拦截属于预期，与主流程的统计口径一致
+  sp.on('console', (m) => {
+    const src = m.location()?.url || '';
+    if (/Content Security Policy/.test(m.text()) && !src.includes('/.netlify/') && src !== 'about:srcdoc') cspErr.push(`${m.text()} @ ${src}`);
+  });
   // 只有线上（Netlify 下发 CSP 响应头）且云端模式时才能在新上下文打开同一账本
   if (isCloudMode && !server) {
     await sp.goto(page.url());
     await sp.waitForSelector('#stats .bar-fill');
     const w = await sp.$$eval('#stats .bar-fill', (els) => els.map((e) => e.getBoundingClientRect().width));
-    ok(w.length > 0 && w.every((x) => x > 0) && cspErr.length === 0, '真实 CSP 下条形图宽度生效、无 CSP 报错');
+    ok(w.length > 0 && w.every((x) => x > 0), '真实 CSP 下条形图宽度生效');
+    ok(cspErr.length === 0, '真实 CSP 下站点自身无 CSP 报错 ' + cspErr.join(' | '));
   }
   await strict.close();
 }
