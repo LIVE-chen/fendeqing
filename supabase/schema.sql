@@ -100,9 +100,11 @@ begin
   end loop;
 
   -- 限流：同一 IP 每小时最多 20 个账本，全站每小时最多 2000 个
+  -- 优先 cf-connecting-ip（Cloudflare 设置，客户端伪造会被拒绝）；
+  -- 兜底取 x-forwarded-for 的最后一段：客户端自带的值会被拼在前面，最后一段才是代理看到的真实地址（2026-10 线上实测）
   v_ip := coalesce(
-    current_setting('request.headers', true)::json ->> 'cf-connecting-ip',
-    split_part(current_setting('request.headers', true)::json ->> 'x-forwarded-for', ',', 1),
+    nullif(btrim(current_setting('request.headers', true)::json ->> 'cf-connecting-ip'), ''),
+    nullif(btrim(regexp_replace(current_setting('request.headers', true)::json ->> 'x-forwarded-for', '^.*,', '')), ''),
     'unknown');
   v_ip_hash := encode(extensions.digest(btrim(v_ip), 'sha256'), 'hex');
   if (select count(*) from public.ledgers
@@ -154,6 +156,7 @@ begin
   if p_participants is null or cardinality(p_participants) < 1 or cardinality(p_participants) > 20 then
     raise exception '分摊成员数量需在 1~20 之间' using errcode = '22023';
   end if;
+  -- 允许 current_date + 1：数据库按 UTC 计日期，北京时间 0~8 点时本地"今天"比 UTC 早一天
   if p_spent_on is null or p_spent_on > current_date + 1 or p_spent_on < date '2000-01-01' then
     raise exception '日期不合法' using errcode = '22023';
   end if;
