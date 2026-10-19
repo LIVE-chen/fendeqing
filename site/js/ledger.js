@@ -3,19 +3,25 @@ import { store, isCloud, rememberLedger } from './store.js';
 import { h, $, toast, errMsg, today, withBusy } from './ui.js';
 
 let state = null; // { token, name, members, entries }
+let renderSeq = 0; // 每次渲染递增；请求返回时序号已过期就丢弃结果，避免快速切换账本时旧数据覆盖新页面
+
+const isCurrent = (seq, token) => seq === renderSeq && location.hash.startsWith(`#/l/${token}`);
 
 // quiet=true：操作后刷新时保留当前内容，避免云端请求期间页面闪成"加载中"
 export async function renderLedger(root, token, { quiet = false } = {}) {
+  const seq = ++renderSeq;
   if (!quiet) root.replaceChildren(h('section', { class: 'card empty' }, h('p', {}, '加载中…')));
   else root.setAttribute('aria-busy', 'true');
   try {
     const data = await store.getLedger(token);
+    if (!isCurrent(seq, token)) return;
     state = { token, ...data };
     rememberLedger(token, data.name);
     paint(root);
     root.removeAttribute('aria-busy');
   } catch (e) {
     console.error('[load]', e);
+    if (!isCurrent(seq, token)) return;
     root.removeAttribute('aria-busy');
     if (quiet) { toast(errMsg(e), true); return; }
     root.replaceChildren(h('section', { class: 'card empty' },
@@ -44,7 +50,7 @@ function paint(root) {
       h('button', { class: 'btn ghost', onclick: () => copyLink(shareUrl) }, isCloud ? '复制邀请链接' : '复制链接'),
       h('button', { class: 'btn ghost', 'aria-label': '刷新账本', onclick: () => renderLedger(root, state.token) }, '刷新')));
 
-  const settle = h('section', { class: 'card' },
+  const settle = h('section', { class: 'card', id: 'settle' },
     h('h2', {}, '结算方案'),
     transfers.length === 0
       ? h('p', { class: 'muted' }, state.entries.length ? '账已经平了，没有人欠钱。' : '还没有记录，先记一笔吧。')
@@ -98,6 +104,15 @@ async function markRepaid(root, btn, t) {
   if (!confirm(`确认 ${nameOf(t.from)} 已向 ${nameOf(t.to)} 转账 ${formatCents(t.amount)}？`)) return;
   await withBusy(btn, async () => {
     try {
+      // 写入前重新拉取：别的设备可能已经记过这笔还款，避免按过时的结算方案重复记账
+      const latest = await store.getLedger(state.token);
+      const still = minimizeTransfers(computeBalances(latest.members, latest.entries))
+        .some((x) => x.from === t.from && x.to === t.to && x.amount === t.amount);
+      if (!still) {
+        toast('账本已被其他人更新，已刷新结算方案', true);
+        await renderLedger(root, state.token, { quiet: true });
+        return;
+      }
       await store.addEntry(state.token, {
         kind: 'transfer', title: '结算转账', amount: t.amount,
         payerId: t.from, participantIds: [t.to], spentOn: today(),
@@ -144,7 +159,15 @@ $('#toggle-all').addEventListener('click', () => {
   const allOn = boxes.every((b) => b.checked);
   boxes.forEach((b) => { b.checked = !allOn; });
 });
-$('#entry-cancel').addEventListener('click', () => dialog.close());
+// 提交请求进行中不允许关闭弹窗（Esc 触发 cancel 事件；取消按钮在提交期间同样无效）
+const submitting = () => $('#entry-submit').disabled;
+// Chrome 连续两次 Esc 时第二次 cancel 不可取消，所以还要在 keydown 阶段拦截。
+// 按钮 disabled 后焦点会落到 body，因此在 document 捕获阶段监听，而不是只监听 dialog。
+dialog.addEventListener('cancel', (ev) => { if (submitting()) ev.preventDefault(); });
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && dialog.open && submitting()) ev.preventDefault();
+}, true);
+$('#entry-cancel').addEventListener('click', () => { if (!submitting()) dialog.close(); });
 
 form.addEventListener('submit', (ev) => {
   ev.preventDefault();

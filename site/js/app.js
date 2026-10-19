@@ -56,7 +56,7 @@ function renderHome() {
   app.replaceChildren(...[
     h('section', { class: 'hero' },
       h('h1', {}, '合租、旅行、聚餐，账一次分清'),
-      h('p', {}, '免注册 · 不限记账条数 · 自动算出最少转账'),
+      h('p', {}, '免注册 · 不限每天记几笔 · 自动算出最少转账'),
     ),
     form,
     recent.length ? h('section', { class: 'card' }, h('h2', {}, '最近打开'),
@@ -73,6 +73,7 @@ function renderHome() {
 // ---------- 路由 ----------
 // token 放在 # 片段里：不会出现在服务器访问日志和 Referer 中
 function route() {
+  app.removeAttribute('aria-busy'); // 离开账本页时，未完成的静默刷新不再负责清除这个标记
   const m = location.hash.match(/^#\/l\/([^/?]+)/);
   if (m) {
     if (!isValidToken(m[1])) {

@@ -68,8 +68,7 @@ async function addExpense(title, amount, payerIdx, uncheck = []) {
   await page.selectOption('select[name=payer]', { index: payerIdx });
   for (const i of uncheck) await page.locator('input[name=participant]').nth(i).uncheck();
   await page.click('#entry-submit');
-  await page.waitForSelector('dialog[open]', { state: 'detached', timeout: 3000 }).catch(() => {});
-  await page.waitForFunction(() => !document.querySelector('#entry-dialog').open, undefined, { timeout: 15000 });
+  await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
   await page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
 }
 
@@ -85,13 +84,23 @@ await page.click('#entry-submit');
 ok((await page.textContent('#entry-error')).includes('至少选择一位'), '无分摊人被拦截');
 await hideToast();
 await page.screenshot({ path: shots + '3-add-entry.png' });
-await page.click('#entry-cancel');
+// 提交进行中（保存按钮 disabled）按 Esc 或点取消都不能关闭弹窗；空闲时 Esc 可以关闭
+await page.evaluate(() => { document.querySelector('#entry-submit').disabled = true; });
+await page.keyboard.press('Escape');
+await page.keyboard.press('Escape');
+ok(await page.evaluate(() => document.querySelector('#entry-dialog').open), '提交中按 Esc 不会关闭弹窗');
+await page.locator('#entry-cancel').click({ timeout: 5000 });
+ok(await page.evaluate(() => document.querySelector('#entry-dialog').open), '提交中点取消不会关闭弹窗');
+await page.evaluate(() => { document.querySelector('#entry-submit').disabled = false; });
+await page.keyboard.press('Escape');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 3000 });
+ok(true, '空闲时按 Esc 关闭弹窗');
 
 await addExpense('10 月房租', '4500', 0);
 await addExpense('电费', '186.4', 2);
 await addExpense('火锅（小李没去）', '268', 1, [2]);
 await page.waitForSelector('.transfer');
-const settleText = await page.textContent('.card:nth-of-type(2)');
+const settleText = await page.textContent('#settle');
 ok(settleText.includes('笔就能结清'), '生成结算方案');
 await hideToast();
 await page.screenshot({ path: shots + '2-ledger.png' });
@@ -101,6 +110,24 @@ await page.screenshot({ path: shots + '2-ledger-full.png', fullPage: true });
 await page.reload();
 await page.waitForSelector('.entries');
 ok(await page.locator('.entries li').count() === 3, '刷新后 3 条记录仍在（数据持久化）');
+
+// 并发标记已还：另一个标签页先记了这笔还款，原页面再点同一笔时不应重复记账
+// 同一浏览器上下文：本机模式共享 localStorage，云端模式共享服务端数据，两种模式都适用
+{
+  const p2 = await ctx.newPage();
+  p2.on('dialog', (d) => d.accept());
+  await p2.goto(page.url());
+  await p2.waitForSelector('.transfer button');
+  const n = await p2.locator('.transfer button').count();
+  await p2.locator('.transfer button').first().click();
+  await p2.waitForFunction((k) => document.querySelectorAll('.transfer button').length < k, n, { timeout: 15000 });
+  await p2.close();
+  await page.locator('.transfer button').first().click();
+  await page.waitForSelector('#toast:not([hidden])');
+  ok((await page.textContent('#toast')).includes('已被其他人更新'), '结算方案过时时提示已更新');
+  await page.waitForFunction(() => !document.querySelector('#app').hasAttribute('aria-busy'));
+  ok(await page.locator('.entries .tag').count() === 1, '并发标记已还不会重复记还款');
+}
 
 // 标记全部已还
 // 云端模式下每次操作要等请求返回，按 aria-busy 判断刷新是否完成
