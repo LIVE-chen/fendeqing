@@ -49,6 +49,10 @@
       <label>日期
         <input name="spentOn" type="date" required />
       </label>
+      <div id="repeat-row">
+        <label class="check-row"><input type="checkbox" name="repeat" id="repeat" aria-describedby="repeat-hint" />每月重复（房租、水电、会员费等）</label>
+        <p class="hint" id="repeat-hint" aria-live="polite"></p>
+      </div>
       <p class="form-error" id="entry-error" role="alert"></p>
       <div class="actions">
         <button type="button" class="btn ghost" id="entry-cancel">取消</button>

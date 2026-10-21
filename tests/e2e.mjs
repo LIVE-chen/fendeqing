@@ -373,6 +373,66 @@ await page.reload();
 await page.waitForSelector('.entries');
 ok((await page.textContent('#balances')).includes('李雷') && (await page.textContent('.ledger-head')).includes('4 人'), '刷新后成员变更仍然保留');
 
+// #12 周期账单：首次日期选在两个月前的 15 号，新建时立即补记到今天
+const bjNow = new Date(Date.now() + 8 * 3600_000);
+const iso = (y, m, d) => new Date(Date.UTC(y, m, d)).toISOString().slice(0, 10);
+const startOn = iso(bjNow.getUTCFullYear(), bjNow.getUTCMonth() - 2, 15);
+const expectN = bjNow.getUTCDate() >= 15 ? 3 : 2;
+const monthly = () => page.locator('.entries li', { hasText: '房租' }).locator('.tag:text("每月")').count();
+await page.click('.fab');
+await page.fill('input[name=title]', '房租');
+await page.fill('input[name=amount]', '3000');
+await page.locator('input[name=participant]').nth(3).uncheck();
+ok(await page.isVisible('#repeat'), '新记一笔时显示"每月重复"');
+await page.check('#repeat');
+await page.fill('input[name=spentOn]', startOn);
+ok((await page.textContent('#repeat-hint')).includes(`${expectN} 笔会立即补记`), '勾选每月重复后提示将补记的笔数');
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await page.waitForSelector('#recurring');
+await busyDone();
+ok(await monthly() === expectN, `新建周期账单立即补记 ${expectN} 笔，并显示"每月"标签`);
+ok((await page.textContent('#recurring')).includes('每月 15 号'), '周期账单卡片显示每月几号');
+await page.reload();
+await page.waitForSelector('#recurring');
+ok(await monthly() === expectN, '重新打开账本不会重复补记');
+// 未来的首次日期：先不记账
+await page.click('.fab');
+await page.fill('input[name=title]', '视频会员');
+await page.fill('input[name=amount]', '25');
+await page.check('#repeat');
+const future = iso(bjNow.getUTCFullYear(), bjNow.getUTCMonth(), bjNow.getUTCDate() + 10);
+await page.fill('input[name=spentOn]', future);
+ok((await page.textContent('#repeat-hint')).includes(`第一笔在 ${future}`), '未来的首次日期：提示第一笔的日期');
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await page.waitForSelector('#recurring li:has-text("视频会员")');
+await busyDone();
+ok(!(await page.textContent('.entries')).includes('视频会员'), '首次日期未到时不记账');
+await page.getByRole('button', { name: '编辑 房租' }).first().click();
+ok(await page.locator('#repeat-row').isHidden(), '编辑支出时不显示"每月重复"');
+await page.keyboard.press('Escape');
+await page.click('#open-members');
+await page.getByRole('button', { name: '小王退出账本' }).click();
+await page.waitForFunction(() => document.querySelector('#members-error').textContent.includes('周期账单'));
+ok(true, '还在周期账单里的成员不能退出');
+await page.click('#members-close');
+await hideToast();
+await page.evaluate(() => { document.querySelector('.fab').hidden = true; }); // 悬浮按钮会挡住卡片底部
+await page.locator('#recurring').screenshot({ path: shots + '11-recurring.png' });
+await page.evaluate(() => { document.querySelector('.fab').hidden = false; });
+await page.getByRole('button', { name: '删除周期账单 房租' }).click();
+await page.waitForFunction(() => !document.querySelector('#recurring')?.textContent.includes('房租'));
+await busyDone();
+ok(await page.locator('.entries li', { hasText: '房租' }).count() === expectN && await monthly() === 0, '删除周期账单后已记的流水保留');
+await page.getByRole('button', { name: '删除周期账单 视频会员' }).click();
+await page.waitForFunction(() => !document.querySelector('#recurring'));
+ok(true, '没有周期账单时不显示卡片');
+await page.click('#open-history');
+await page.waitForSelector('#history-log li:has-text("新建周期账单")');
+ok((await page.textContent('#history-log')).includes('自动记入周期账单「房租」'), '操作记录里能看到自动记账');
+await page.click('#history-close');
+
 // 无效链接
 await page.goto(base + '#/l/abc');
 ok(await page.isVisible('text=链接无效'), '无效链接有友好提示');

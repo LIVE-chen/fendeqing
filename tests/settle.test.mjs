@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName, describeActivity } from '../site/js/settle.js';
+import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName, describeActivity, nextMonthDay, bjToday, dueDates } from '../site/js/settle.js';
 
 test('parseAmount 接受合法金额', () => {
   assert.equal(parseAmount('12'), 1200);
@@ -191,6 +191,30 @@ test('describeActivity：各类操作的描述，未知类型不报错', () => {
   assert.equal(describeActivity({ action: 'leave_member', detail: { name: 'C' } }), 'C退出账本');
   assert.equal(describeActivity({ action: 'restore_member', detail: { name: 'C' } }), 'C重新加入');
   assert.equal(describeActivity({ action: 'add_member', detail: { name: 'D' } }), '添加成员D');
+  assert.equal(describeActivity({ action: 'add_entry', detail: { kind: 'expense', title: '房租', amount: 300000, recurring: true } }), '自动记入周期账单「房租」¥3,000.00');
+  assert.equal(describeActivity({ action: 'add_recurring', detail: { title: '房租', amount: 300000, day: 31 } }), '新建周期账单「房租」每月 31 号 ¥3,000.00');
+  assert.equal(describeActivity({ action: 'delete_recurring', detail: { title: '房租', amount: 300000 } }), '删除周期账单「房租」');
   assert.equal(describeActivity({ action: 'future_thing', detail: {} }), '其他操作');
   assert.equal(describeActivity(null), '其他操作');
+});
+
+test('nextMonthDay：月底顺延且不漂移、跨年、闰年', () => {
+  const seq = [];
+  let d = '2026-01-31';
+  for (let i = 0; i < 4; i++) seq.push(d = nextMonthDay(d, 31));
+  assert.deepEqual(seq, ['2026-02-28', '2026-03-31', '2026-04-30', '2026-05-31']);
+  assert.equal(nextMonthDay('2027-12-15', 15), '2028-01-15');
+  assert.equal(nextMonthDay('2028-01-29', 29), '2028-02-29');
+  assert.equal(nextMonthDay('2029-01-29', 29), '2029-02-28');
+});
+
+test('bjToday：按 UTC+8 计算日期', () => {
+  assert.equal(bjToday(Date.UTC(2026, 9, 20, 15, 59)), '2026-10-20');
+  assert.equal(bjToday(Date.UTC(2026, 9, 20, 16, 0)), '2026-10-21');
+});
+
+test('dueDates：列出到期期数并给出下一期', () => {
+  assert.deepEqual(dueDates('2026-08-31', 31, '2026-10-20'), { dates: ['2026-08-31', '2026-09-30'], nextOn: '2026-10-31' });
+  assert.deepEqual(dueDates('2026-11-01', 1, '2026-10-20'), { dates: [], nextOn: '2026-11-01' });
+  assert.deepEqual(dueDates('2026-01-05', 5, '2026-10-20', 2), { dates: ['2026-01-05', '2026-02-05'], nextOn: '2026-03-05' });
 });
