@@ -370,3 +370,97 @@ test('上限：回收站最多 100 条、超过 30 天自动清理；日志最�
   const del = (await history(t)).deleted[0].id;
   await rejects(asAnon('select public.restore_entry($1,$2)', [t, del]), /2000/);
 });
+
+// ---------- #12 周期账单 ----------
+const q1 = async (sql, params) => (await db.query(sql, params)).rows[0];
+
+test('_next_month_day：月底顺延，且不会"漂移"到 28 号', async () => {
+  const seq = [];
+  let d = '2026-01-31';
+  for (let i = 0; i < 4; i++) { d = (await q1(`select public._next_month_day($1::date, 31)::text d`, [d])).d; seq.push(d); }
+  assert.deepEqual(seq, ['2026-02-28', '2026-03-31', '2026-04-30', '2026-05-31']);
+  assert.equal((await q1(`select public._next_month_day('2027-12-15', 15)::text d`)).d, '2028-01-15');
+  assert.equal((await q1(`select public._next_month_day('2028-01-29', 29)::text d`)).d, '2028-02-29', '闰年');
+});
+
+test('周期账单：新建时补记过去的期数，按月推进，重复打开不会重复记', async () => {
+  const { t, ids, get } = await ledgerWith(['a', 'b'], '50.0.0.1');
+  const today = (await q1(`select public._bj_today()::text d`)).d;
+  const start = (await q1(`select (public._bj_today() - interval '2 months')::date::text d`)).d;
+  const r = (await asAnon(`select public.add_recurring($1,'房租',300000,$2,$3::uuid[],$4::date) r`, [t, ids[0], ids, start])).rows[0].r;
+  assert.ok(r.id);
+  assert.equal(r.added, 3, '两个月前开始：补记 3 期（含本月）');
+  for (let i = 0; i < 2; i++) assert.equal((await asAnon('select public.run_recurring($1) n', [t])).rows[0].n, 0);
+  const l = await get();
+  assert.equal(l.entries.length, 3);
+  assert.ok(l.entries.every((e) => e.recurringId === r.id && e.title === '房租' && e.amount === 300000));
+  assert.ok(l.entries.every((e) => e.spentOn <= today), '不会记未来的账');
+  assert.equal(l.entries.at(-1).spentOn, start, '第一期在首次日期');
+  assert.equal(l.recurring.length, 1);
+  assert.ok(l.recurring[0].nextOn > today, '下一次在今天之后');
+  assert.equal(l.today, today);
+});
+
+test('周期账单：首次日期在未来时不记账，到期后 run_recurring 补记', async () => {
+  const { t, ids, get } = await ledgerWith(['a', 'b'], '50.0.0.2');
+  const start = (await q1(`select (public._bj_today() + 3)::text d`)).d;
+  const r = (await asAnon(`select public.add_recurring($1,'网费',10000,$2,$3::uuid[],$4::date,'ratio',array[2,1]::bigint[]) r`, [t, ids[1], ids, start])).rows[0].r;
+  assert.equal(r.added, 0);
+  assert.equal((await get()).entries.length, 0);
+  await db.query(`update public.recurring set next_on = next_on - 3 where id = $1`, [r.id]); // 模拟时间流逝
+  assert.equal((await asAnon('select public.run_recurring($1) n', [t])).rows[0].n, 1);
+  const e = (await get()).entries[0];
+  assert.equal(e.splitMode, 'ratio');
+  assert.deepEqual(e.shares, [2, 1]);
+});
+
+test('周期账单：校验、上限、跨账本隔离、退出成员、删除后流水保留', async () => {
+  const { t, ids, get } = await ledgerWith(['a', 'b', 'c'], '50.0.0.3');
+  const add = (o = {}) => asAnon(`select public.add_recurring($1,$2,$3,$4,$5::uuid[],$6::date,$7,$8::bigint[]) r`,
+    [o.t ?? t, o.title ?? 'x', o.amount ?? 100, o.payer ?? ids[0], o.parts ?? ids, o.start ?? '2099-01-01', o.mode ?? 'equal', o.shares ?? null]);
+  await rejects(add({ start: '2099-01-01' }), /前后一年/);
+  const far = (await q1(`select (public._bj_today() - 400)::text d`)).d;
+  await rejects(add({ start: far }), /前后一年/);
+  const ok = (await q1(`select (public._bj_today() + 1)::text d`)).d;
+  await rejects(add({ start: ok, amount: 0 }), /金额/);
+  await rejects(add({ start: ok, mode: 'amount', shares: [1, 2, 3] }), /之和/);
+  await rejects(add({ start: ok, title: ' ' }), /内容/);
+  const B = await ledgerWith(['x', 'y'], '50.0.0.3');
+  await rejects(add({ start: ok, payer: B.ids[0] }), /不属于/);
+  const r = (await add({ start: ok, parts: [ids[0], ids[2]] })).rows[0].r;
+  await rejects(asAnon('select public.delete_recurring($1,$2)', [B.t, r.id]), /不存在/);
+  await rejects(asAnon('select public.leave_member($1,$2)', [t, ids[2]]), /周期账单/);
+  await asAnon('select public.leave_member($1,$2)', [t, ids[1]]); // 不在周期账单里的人可以退出
+  await rejects(add({ start: ok, parts: [ids[0], ids[1]] }), /已退出/);
+  // 生成一笔流水后删除周期账单：流水保留，关联断开
+  await db.query(`update public.recurring set next_on = public._bj_today() where id = $1`, [r.id]);
+  await asAnon('select public.run_recurring($1)', [t]);
+  await asAnon('select public.delete_recurring($1,$2)', [t, r.id]);
+  const l = await get();
+  assert.equal(l.recurring.length, 0);
+  assert.equal(l.entries.length, 1);
+  assert.equal(l.entries[0].recurringId, null);
+  await asAnon(`select public.add_member($1,'d')`, [t]);
+  await asAnon('select public.leave_member($1,$2)', [t, ids[2]]); // 周期账单删掉后，c 可以退出了
+  for (let i = 0; i < 20; i++) await add({ start: ok, parts: [ids[0]] });
+  await rejects(add({ start: ok, parts: [ids[0]] }), /最多 20 个/);
+  const acts = (await history(t)).activities.map((x) => x.action);
+  assert.ok(acts.includes('add_recurring') && acts.includes('delete_recurring'));
+});
+
+test('周期账单：账本满 2000 条时暂停补记，腾出空间后继续；anon 不能读 recurring 表、不能调内部函数', async () => {
+  const { t, ids, get } = await ledgerWith(['a', 'b'], '50.0.0.4');
+  const lid = (await q1(`select ledger_id l from public.members where id = $1`, [ids[0]])).l;
+  await db.query(`insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids)
+    select $1, 'expense', 'live', 100, $2, $3::uuid[] from generate_series(1, 1999)`, [lid, ids[0], ids]);
+  const start = (await q1(`select (public._bj_today() - interval '2 months')::date::text d`)).d;
+  const r = (await asAnon(`select public.add_recurring($1,'x',100,$2,$3::uuid[],$4::date) r`, [t, ids[0], ids, start])).rows[0].r;
+  assert.equal(r.added, 1, '只记到 2000 条为止');
+  assert.equal((await asAnon('select public.run_recurring($1) n', [t])).rows[0].n, 0);
+  await db.query(`delete from public.entries where ledger_id = $1 and title = 'live' and id in (select id from public.entries where ledger_id = $1 and title = 'live' limit 5)`, [lid]);
+  assert.equal((await asAnon('select public.run_recurring($1) n', [t])).rows[0].n, 2, '腾出空间后补齐剩下的期数');
+  assert.equal((await get()).entries.length, 1997);
+  await rejects(asAnon('select * from public.recurring'), /permission denied/);
+  await rejects(asAnon(`select public._run_recurring(gen_random_uuid())`), /permission denied/);
+  await rejects(asAnon(`select public._bj_today()`), /permission denied/);
+});

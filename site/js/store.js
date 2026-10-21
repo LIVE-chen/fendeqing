@@ -1,5 +1,6 @@
 // 数据层：配置了 Supabase 就走云端 RPC；否则退回浏览器 localStorage（仅本机可见，便于离线演示）
 import { CONFIG } from './config.js';
+import { bjToday, dueDates } from './settle.js';
 
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 export const isCloud = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey);
@@ -53,6 +54,13 @@ const cloud = {
   deleteEntry: (token, id) => rpc('delete_entry', { p_token: token, p_entry: id }),
   restoreEntry: (token, id) => rpc('restore_entry', { p_token: token, p_entry: id }),
   getHistory: (token) => rpc('get_history', { p_token: token }),
+  addRecurring: (token, r) => rpc('add_recurring', {
+    p_token: token, p_title: r.title, p_amount: r.amount, p_payer: r.payerId,
+    p_participants: r.participantIds, p_start_on: r.startOn,
+    ...(r.splitMode && r.splitMode !== 'equal' ? { p_split_mode: r.splitMode, p_shares: r.shares } : {}),
+  }),
+  deleteRecurring: (token, id) => rpc('delete_recurring', { p_token: token, p_recurring: id }),
+  runRecurring: (token) => rpc('run_recurring', { p_token: token }),
   addMember: (token, name) => rpc('add_member', { p_token: token, p_name: name }),
   renameMember: (token, id, name) => rpc('rename_member', { p_token: token, p_member: id, p_name: name }),
   leaveMember: (token, id) => rpc('leave_member', { p_token: token, p_member: id }),
@@ -91,8 +99,46 @@ const local = {
   },
   async getLedger(token) {
     const d = readLocal(token);
-    // 旧数据没有 left / deleted / activities 字段
-    return { name: d.name, members: d.members.map((m) => ({ ...m, left: Boolean(m.left) })), entries: d.entries };
+    // 旧数据没有 left / deleted / activities / recurring 字段
+    return {
+      name: d.name, members: d.members.map((m) => ({ ...m, left: Boolean(m.left) })), entries: d.entries,
+      recurring: d.recurring ?? [], today: bjToday(),
+    };
+  },
+  async addRecurring(token, r) {
+    const d = readLocal(token);
+    d.recurring ??= [];
+    if (d.recurring.length >= 20) throw new StoreError('每个账本最多 20 个周期账单');
+    const today = bjToday();
+    const shift = (days) => new Date(Date.parse(today) + days * 86400_000).toISOString().slice(0, 10);
+    if (!r.startOn || r.startOn < shift(-366) || r.startOn > shift(366)) throw new StoreError('首次日期需在前后一年内');
+    checkActive(d, r, []);
+    const id = uuid();
+    const splitMode = r.splitMode ?? 'equal';
+    const dayOfMonth = Number(r.startOn.slice(8, 10));
+    d.recurring.push({
+      id, title: r.title, amount: r.amount, payerId: r.payerId, participantIds: r.participantIds,
+      splitMode, shares: splitMode === 'equal' ? null : r.shares, dayOfMonth, nextOn: r.startOn,
+    });
+    log(d, 'add_recurring', { title: r.title, amount: r.amount, day: dayOfMonth });
+    const added = runLocal(d);
+    writeLocal(token, d);
+    return { id, added };
+  },
+  async deleteRecurring(token, id) {
+    const d = readLocal(token);
+    const r = (d.recurring ?? []).find((x) => x.id === id);
+    if (!r) throw new StoreError('周期账单不存在');
+    d.recurring = d.recurring.filter((x) => x !== r);
+    for (const e of [...d.entries, ...(d.deleted ?? [])]) if (e.recurringId === id) e.recurringId = null;
+    log(d, 'delete_recurring', { title: r.title, amount: r.amount });
+    writeLocal(token, d);
+  },
+  async runRecurring(token) {
+    const d = readLocal(token);
+    const added = runLocal(d);
+    if (added) writeLocal(token, d);
+    return added;
   },
   async getHistory(token) {
     const d = readLocal(token);
@@ -178,6 +224,9 @@ const local = {
     const m = d.members.find((x) => x.id === id && !x.left);
     if (!m) throw new StoreError('成员不存在或已退出');
     if (d.members.filter((x) => !x.left).length <= 2) throw new StoreError('账本至少需要 2 位成员');
+    if ((d.recurring ?? []).some((r) => r.payerId === id || r.participantIds.includes(id))) {
+      throw new StoreError('该成员还在周期账单里，请先删除相关的周期账单');
+    }
     m.left = true;
     log(d, 'leave_member', { name: m.name });
     writeLocal(token, d);
@@ -188,6 +237,29 @@ const local = {
 function checkActive(d, e, extra) {
   const left = new Set(d.members.filter((m) => m.left && !extra.includes(m.id)).map((m) => m.id));
   if ([e.payerId, ...e.participantIds].some((id) => left.has(id))) throw new StoreError('已退出的成员不能参与新的支出');
+}
+
+/** 补记到期的周期账单（与服务端 _run_recurring 一致：满 2000 条时暂停，nextOn 不前进） */
+function runLocal(d) {
+  const today = bjToday();
+  let added = 0;
+  const due = (d.recurring ?? []).filter((r) => r.nextOn <= today)
+    .sort((a, b) => a.nextOn.localeCompare(b.nextOn) || a.id.localeCompare(b.id));
+  for (const r of due) {
+    const { dates, nextOn } = dueDates(r.nextOn, r.dayOfMonth, today, Math.max(0, 2000 - d.entries.length));
+    for (const spentOn of dates) {
+      d.entries.push({
+        id: uuid(), kind: 'expense', title: r.title, amount: r.amount, payerId: r.payerId,
+        participantIds: [...r.participantIds], spentOn, splitMode: r.splitMode, shares: r.shares,
+        recurringId: r.id, createdAt: now(),
+      });
+      log(d, 'add_entry', { kind: 'expense', title: r.title, amount: r.amount, recurring: true });
+      added += 1;
+    }
+    r.nextOn = nextOn;
+  }
+  if (added) d.entries.sort(byDate);
+  return added;
 }
 
 export const store = isCloud ? cloud : local;

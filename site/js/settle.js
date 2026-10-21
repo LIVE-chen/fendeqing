@@ -176,7 +176,8 @@ export function validateMembers(names) {
 
 const ACTION_TEXT = {
   create: (d) => `创建账本「${d.name}」，成员：${(d.members ?? []).join('、')}`,
-  add_entry: (d) => (d.kind === 'transfer' ? `记录还款 ${formatCents(d.amount)}` : `记一笔「${d.title}」${formatCents(d.amount)}`),
+  add_entry: (d) => (d.kind === 'transfer' ? `记录还款 ${formatCents(d.amount)}`
+    : `${d.recurring ? '自动记入周期账单' : '记一笔'}「${d.title}」${formatCents(d.amount)}`),
   update_entry: (d) => {
     const parts = [];
     if (d.oldTitle !== d.title) parts.push(`「${d.oldTitle}」→「${d.title}」`);
@@ -190,6 +191,8 @@ const ACTION_TEXT = {
   rename_member: (d) => `${d.oldName} 改名为 ${d.name}`,
   leave_member: (d) => `${d.name}退出账本`,
   restore_member: (d) => `${d.name}重新加入`,
+  add_recurring: (d) => `新建周期账单「${d.title}」每月 ${d.day} 号 ${formatCents(d.amount)}`,
+  delete_recurring: (d) => `删除周期账单「${d.title}」`,
 };
 
 /** 操作日志 → 一句话描述；未知类型（例如新版本才有的操作）不报错 */
@@ -197,4 +200,29 @@ export function describeActivity(a) {
   const f = ACTION_TEXT[a?.action];
   if (!f) return '其他操作';
   try { return f(a.detail ?? {}); } catch { return '其他操作'; }
+}
+
+// ---------- 周期账单的日期计算（与数据库 _next_month_day 规则一致，供本地模式使用） ----------
+const daysIn = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate(); // m 为 1~12
+const pad2 = (n) => String(n).padStart(2, '0');
+
+/** "YYYY-MM-DD" 的下一个月第 dom 日；那个月没有这一天时取月底 */
+export function nextMonthDay(iso, dom) {
+  let [y, m] = iso.split('-').map(Number);
+  m += 1;
+  if (m > 12) { m = 1; y += 1; }
+  return `${y}-${pad2(m)}-${pad2(Math.min(dom, daysIn(y, m)))}`;
+}
+
+/** 北京时间的今天（与服务端 _bj_today 一致，不受手机时区影响） */
+export function bjToday(now = Date.now()) {
+  return new Date(now + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
+/** 从 nextOn 起列出所有不晚于 today 的期数（最多 max 期），返回 { dates, nextOn } */
+export function dueDates(nextOn, dom, today, max = Infinity) {
+  const dates = [];
+  let d = nextOn;
+  while (d <= today && dates.length < max) { dates.push(d); d = nextMonthDay(d, dom); }
+  return { dates, nextOn: d };
 }

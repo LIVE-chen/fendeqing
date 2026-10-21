@@ -1,6 +1,6 @@
 import {
   parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares,
-  centsToInput, canLeave, isActive, validateMemberName, describeActivity,
+  centsToInput, canLeave, isActive, validateMemberName, describeActivity, dueDates,
 } from './settle.js';
 import { monthlyTotals, memberStats, barPercents, ledgerSheets, exportFileName } from './stats.js';
 import { buildXlsx } from './xlsx.js';
@@ -18,12 +18,17 @@ export async function renderLedger(root, token, { quiet = false } = {}) {
   if (!quiet) root.replaceChildren(h('section', { class: 'card empty' }, h('p', {}, '加载中…')));
   else root.setAttribute('aria-busy', 'true');
   try {
+    // 先补记到期的周期账单；失败（例如数据库还没升级）不影响打开账本
+    // 操作后的静默刷新跳过这一步，少一次请求（新建周期账单时服务端已经补记过）
+    let added = 0;
+    if (!quiet) try { added = await store.runRecurring(token); } catch (e) { console.warn('[recurring]', e); }
     const data = await store.getLedger(token);
     if (!isCurrent(seq, token)) return;
-    state = { token, ...data };
+    state = { token, ...data, recurring: data.recurring ?? [], today: data.today ?? today() };
     rememberLedger(token, data.name);
     paint(root);
     root.removeAttribute('aria-busy');
+    if (added > 0) toast(`已自动记入 ${added} 笔周期账单`);
   } catch (e) {
     console.error('[load]', e);
     if (!isCurrent(seq, token)) return;
@@ -100,6 +105,7 @@ function paint(root) {
             : `${nameOf(e.payerId)} 付款 · ${weighted ? (e.splitMode === 'ratio' ? '按比例：' : '按金额：') : ''}${who}`;
           const body = [
             h('div', { class: 'entry-title' }, isT ? h('span', { class: 'tag' }, '还款') : null, e.title,
+              e.recurringId ? h('span', { class: 'tag muted-tag' }, '每月') : null,
               e.updatedAt ? h('span', { class: 'tag muted-tag' }, '已编辑') : null),
             h('div', { class: 'muted small' }, `${e.spentOn} · ${sub}`)];
           // 支出整块可点击编辑；还款只能删除
@@ -111,7 +117,39 @@ function paint(root) {
         })));
 
   const fab = h('button', { class: 'fab', onclick: () => openEntryDialog(root) }, '+ 记一笔');
-  root.replaceChildren(header, settle, balanceList, statsCard(), entryList, fab);
+  root.replaceChildren(header, settle, balanceList, recurringCard(root), statsCard(), entryList, fab);
+}
+
+// ---------- 周期账单 ----------
+const dayText = (dom, short = false) => (dom < 29 ? `每月 ${dom} 号`
+  : short ? `每月 ${dom} 号（无此日记月底）` : `每月 ${dom} 号（没有这天的月份记在月底）`);
+
+/** 没有周期账单时不显示卡片，入口在"记一笔"弹窗里 */
+function recurringCard(root) {
+  if (state.recurring.length === 0) return null;
+  const paused = state.entries.length >= 2000 && state.recurring.some((r) => r.nextOn <= state.today);
+  return h('section', { class: 'card', id: 'recurring' },
+    h('h2', {}, '周期账单'),
+    h('ul', { class: 'list' }, state.recurring.map((r) => h('li', {},
+      h('div', { class: 'entry-main' },
+        h('div', { class: 'entry-title' }, r.title),
+        h('div', { class: 'muted small' }, `${dayText(r.dayOfMonth, true)} · ${nameOf(r.payerId)} 付款`),
+        h('div', { class: 'muted small' }, `下次 ${r.nextOn}`)),
+      h('span', { class: 'amount' }, formatCents(r.amount)),
+      h('button', { class: 'icon-btn', 'aria-label': `删除周期账单 ${r.title}`, onclick: (ev) => removeRecurring(root, ev.currentTarget, r) }, '×')))),
+    paused ? h('p', { class: 'hint warn' }, '账本已满 2000 条记录，周期账单暂停自动记账，删除一些旧记录后会继续补记。')
+      : h('p', { class: 'hint' }, '到期后打开账本时自动记入流水，可以像普通支出一样编辑或删除。'));
+}
+
+async function removeRecurring(root, btn, r) {
+  if (!confirm(`删除周期账单「${r.title}」？以后不再自动记账，已经记下的流水会保留。`)) return;
+  await withBusy(btn, async () => {
+    try {
+      await store.deleteRecurring(state.token, r.id);
+      toast('已删除周期账单');
+      await renderLedger(root, state.token, { quiet: true });
+    } catch (e) { toast(errMsg(e), true); }
+  });
 }
 
 // ---------- 统计与导出 ----------
@@ -239,6 +277,8 @@ function openEntryDialog(root, entry = null) {
   $('#participants').replaceChildren(...choices.map((m) =>
     h('label', { class: 'chip' }, h('input', { type: 'checkbox', name: 'participant', value: m.id, checked: checked.has(m.id) }), label(m))));
   shareInputs.replaceChildren();
+  $('#repeat-row').hidden = Boolean(entry); // 只有新记一笔时可以设为每月重复
+  updateRepeat();
   if (entry) {
     form.elements.title.value = entry.title;
     form.elements.amount.value = centsToInput(entry.amount);
@@ -301,6 +341,29 @@ function updatePreview() {
   preview.textContent = mode === 'amount' ? '金额已对上 ✓' : shares.map(([id, c]) => `${nameOf(id)} ${formatCents(c)}`).join('，');
 }
 
+// ---------- 每月重复 ----------
+const repeatBox = $('#repeat');
+const repeatHint = $('#repeat-hint');
+const shiftDays = (iso, n) => new Date(Date.parse(iso) + n * 86400_000).toISOString().slice(0, 10);
+const repeatRange = () => ({ min: shiftDays(state.today, -365), max: shiftDays(state.today, 365) });
+
+/** 勾选后日期变为"首次记账日期"，允许选一年内的未来日期 */
+function updateRepeat() {
+  const on = repeatBox.checked && !editing;
+  const { min, max } = repeatRange();
+  form.elements.spentOn.min = on ? min : '';
+  form.elements.spentOn.max = on ? max : today();
+  const d = form.elements.spentOn.value;
+  if (!on || !/^\d{4}-\d{2}-\d{2}$/.test(d)) { repeatHint.textContent = ''; return; }
+  const dom = Number(d.slice(8, 10));
+  repeatHint.textContent = d <= state.today
+    ? `${dayText(dom)}自动记一笔；从 ${d} 起到今天的 ${dueCount(d, dom)} 笔会立即补记。`
+    : `${dayText(dom)}自动记一笔，第一笔在 ${d}。`;
+}
+const dueCount = (d, dom) => dueDates(d, dom, state.today, 13).dates.length;
+repeatBox.addEventListener('change', updateRepeat);
+form.elements.spentOn.addEventListener('input', updateRepeat);
+
 $('#split-mode').addEventListener('change', () => renderShareInputs({ keep: false }));
 $('#participants').addEventListener('change', () => renderShareInputs());
 shareInputs.addEventListener('input', updatePreview);
@@ -336,15 +399,29 @@ form.addEventListener('submit', (ev) => {
   const mode = splitMode();
   const split = parseSplit(mode, amount, shareValues(participantIds));
   if (!split.ok) return void (errEl.textContent = split.error);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(spentOn) || spentOn > today()) return void (errEl.textContent = '请选择不晚于今天的日期');
+  const repeat = repeatBox.checked && !editing;
+  const valid = /^\d{4}-\d{2}-\d{2}$/.test(spentOn);
+  if (repeat) {
+    const { min, max } = repeatRange();
+    if (!valid || spentOn < min || spentOn > max) return void (errEl.textContent = '首次日期需在前后一年内');
+  } else if (!valid || spentOn > today()) return void (errEl.textContent = '请选择不晚于今天的日期');
 
   withBusy($('#entry-submit'), async () => {
     try {
       const e = { kind: 'expense', title, amount, payerId, participantIds, spentOn, splitMode: mode, shares: split.shares };
-      if (editing) await store.updateEntry(state.token, editing.id, e);
-      else await store.addEntry(state.token, e);
+      let msg;
+      if (repeat) {
+        const { added } = await store.addRecurring(state.token, { ...e, startOn: spentOn });
+        msg = added > 0 ? `已设为每月重复，补记了 ${added} 笔` : `已设为每月重复，${spentOn} 记第一笔`;
+      } else if (editing) {
+        await store.updateEntry(state.token, editing.id, e);
+        msg = '已保存修改';
+      } else {
+        await store.addEntry(state.token, e);
+        msg = `已记录 ${formatCents(amount)}`;
+      }
       dialog.close();
-      toast(editing ? '已保存修改' : `已记录 ${formatCents(amount)}`);
+      toast(msg);
       await renderLedger(currentRoot, state.token, { quiet: true });
     } catch (e) { errEl.textContent = errMsg(e); }
   });
@@ -417,6 +494,12 @@ async function leave(btn, id) {
     try {
       // 用最新数据判断是否已结清，避免别的设备刚记了一笔
       const latest = await store.getLedger(state.token);
+      // 先查周期账单：结清后周期账单还会继续产生新的欠款，所以要先处理它
+      const inRec = (latest.recurring ?? []).filter((x) => x.payerId === id || x.participantIds.includes(id));
+      if (inRec.length) {
+        mErr.textContent = `该成员还在周期账单「${inRec.map((x) => x.title).join('」「')}」里，请先删除相关的周期账单`;
+        return;
+      }
       const r = canLeave(latest.members, computeBalances(latest.members, latest.entries), id);
       if (!r.ok) { mErr.textContent = r.error; return; }
       const name = latest.members.find((m) => m.id === id).name;
