@@ -1,7 +1,7 @@
 -- 分得清 · Supabase 数据库结构（在 SQL Editor 中整段运行，可重复执行）
 -- 安全模型：
 --   * 表全部开启 RLS 且不建策略，并撤销 anon/authenticated 的表权限 => 无法直接读写表；
---   * 前端只能调用 10 个 SECURITY DEFINER 函数，每个都要求提供账本分享口令 token；
+--   * 前端只能调用 13 个 SECURITY DEFINER 函数，每个都要求提供账本分享口令 token；
 --   * token = 128 bit 密码学随机数，只出现在 URL 的 # 片段里；数据库只存 sha256(token)；
 --   * 创建账本按 IP 限流，所有文本在服务端再次校验长度、空白和控制字符。
 begin;
@@ -64,6 +64,28 @@ create table if not exists public.activities (
 create index if not exists activities_ledger_idx on public.activities (ledger_id, id desc);
 alter table public.activities enable row level security;
 revoke all on public.activities from public, anon, authenticated;
+-- 周期账单（#12）：每月 day_of_month 日自动记一笔。没有后台定时任务，打开账本时由 run_recurring 补记到期的账单。
+-- next_on 是下一次应记的日期（北京时间）；小月没有该日时记在月底。
+create table if not exists public.recurring (
+  id uuid primary key default gen_random_uuid(),
+  ledger_id uuid not null references public.ledgers(id) on delete cascade,
+  title text not null check (char_length(title) between 1 and 40),
+  amount bigint not null check (amount > 0 and amount <= 1000000000),
+  payer_id uuid not null references public.members(id) on delete cascade,
+  participant_ids uuid[] not null check (cardinality(participant_ids) between 1 and 20),
+  split_mode text not null default 'equal',
+  shares bigint[],
+  day_of_month int not null check (day_of_month between 1 and 31),
+  next_on date not null,
+  created_at timestamptz not null default now(),
+  check ((split_mode = 'equal' and shares is null)
+         or (split_mode in ('ratio', 'amount') and shares is not null and cardinality(shares) = cardinality(participant_ids)))
+);
+create index if not exists recurring_ledger_idx on public.recurring (ledger_id, next_on);
+alter table public.recurring enable row level security;
+revoke all on public.recurring from public, anon, authenticated;
+-- 由周期账单生成的流水；删除周期账单后保留流水，只断开关联
+alter table public.entries add column if not exists recurring_id uuid references public.recurring(id) on delete set null;
 create index if not exists entries_ledger_idx on public.entries (ledger_id, created_at desc);
 create index if not exists members_ledger_idx on public.members (ledger_id, position);
 
@@ -94,6 +116,44 @@ begin
   insert into public.activities (ledger_id, action, detail) values (p_ledger, p_action, coalesce(p_detail, '{}'));
   delete from public.activities where ledger_id = p_ledger and id <= (
     select id from public.activities where ledger_id = p_ledger order by id desc offset 500 limit 1);
+end $$;
+
+-- 内部：北京时间的今天。中国不实行夏令时，固定 +8 小时，不依赖数据库的时区库
+create or replace function public._bj_today() returns date
+language sql stable set search_path = '' as $$
+  select ((now() at time zone 'UTC') + interval '8 hours')::date
+$$;
+
+-- 内部：p_d 的下一个月里的第 p_dom 日；那个月没有这一天时取月底（例如 1-31 → 2-28 → 3-31）
+create or replace function public._next_month_day(p_d date, p_dom int) returns date
+language sql immutable set search_path = '' as $$
+  select m + (least(p_dom, extract(day from (m + interval '1 month' - interval '1 day'))::int) - 1)
+    from (select (date_trunc('month', p_d) + interval '1 month')::date as m) x
+$$;
+
+-- 内部：补记账本里所有到期的周期账单，返回新记的笔数。调用方需先锁住账本行，保证并发打开不会重复记。
+-- 账本满 2000 条时停止补记（next_on 不前进），腾出空间后下次打开再补。
+create or replace function public._run_recurring(p_ledger uuid) returns int
+language plpgsql volatile set search_path = '' as $$
+declare
+  v_today date := public._bj_today();
+  v_r record;
+  v_n int := 0;
+  v_live int;
+begin
+  select count(*) into v_live from public.entries where ledger_id = p_ledger and deleted_at is null;
+  for v_r in select * from public.recurring where ledger_id = p_ledger and next_on <= v_today order by next_on, id loop
+    while v_r.next_on <= v_today and v_live < 2000 loop
+      insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids, spent_on, split_mode, shares, recurring_id)
+      values (p_ledger, 'expense', v_r.title, v_r.amount, v_r.payer_id, v_r.participant_ids, v_r.next_on, v_r.split_mode, v_r.shares, v_r.id);
+      perform public._log(p_ledger, 'add_entry', jsonb_build_object('kind', 'expense', 'title', v_r.title, 'amount', v_r.amount, 'recurring', true));
+      v_r.next_on := public._next_month_day(v_r.next_on, v_r.day_of_month);
+      v_n := v_n + 1;
+      v_live := v_live + 1;
+    end loop;
+    update public.recurring set next_on = v_r.next_on where id = v_r.id;
+  end loop;
+  return v_n;
 end $$;
 
 -- 内部：token -> ledger id
@@ -170,9 +230,16 @@ begin
     'entries', coalesce((select json_agg(json_build_object(
                   'id', id, 'kind', kind, 'title', title, 'amount', amount, 'payerId', payer_id,
                   'participantIds', participant_ids, 'spentOn', spent_on, 'createdAt', created_at,
-                  'splitMode', split_mode, 'shares', shares, 'updatedAt', updated_at)
+                  'splitMode', split_mode, 'shares', shares, 'updatedAt', updated_at, 'recurringId', recurring_id)
                   order by spent_on desc, created_at desc)
-                 from public.entries where ledger_id = v_id and deleted_at is null), '[]'::json)
+                 from public.entries where ledger_id = v_id and deleted_at is null), '[]'::json),
+    'recurring', coalesce((select json_agg(json_build_object(
+                  'id', id, 'title', title, 'amount', amount, 'payerId', payer_id, 'participantIds', participant_ids,
+                  'splitMode', split_mode, 'shares', shares, 'dayOfMonth', day_of_month, 'nextOn', next_on)
+                  order by created_at, id)
+                 from public.recurring where ledger_id = v_id), '[]'::json),
+    -- 服务端的"今天"（北京时间），前端据此判断是否有到期的周期账单，不受手机时区影响
+    'today', public._bj_today()
   );
 end $$;
 
@@ -375,8 +442,70 @@ begin
   if (select count(*) from public.members where ledger_id = v_id and left_at is null) <= 2 then
     raise exception '账本至少需要 2 位成员' using errcode = '22023';
   end if;
+  if exists (select 1 from public.recurring where ledger_id = v_id and (payer_id = p_member or p_member = any(participant_ids))) then
+    raise exception '该成员还在周期账单里，请先删除相关的周期账单' using errcode = '22023';
+  end if;
   update public.members set left_at = now() where id = p_member;
   perform public._log(v_id, 'leave_member', jsonb_build_object('name', (select name from public.members where id = p_member)));
+end $$;
+
+-- 新建周期账单：p_start_on 是第一次记账的日期（也决定每月几号），最早一年前、最晚一年后。
+-- 首次日期不晚于今天时立即补记，返回 { id, added }。
+create or replace function public.add_recurring(
+  p_token text, p_title text, p_amount bigint, p_payer uuid, p_participants uuid[], p_start_on date,
+  p_split_mode text default 'equal', p_shares bigint[] default null
+) returns json language plpgsql volatile security definer set search_path = '' as $$
+declare
+  v_id uuid := public._ledger_id(p_token);
+  v_title text := public._clean(p_title, 40, '内容');
+  v_chk record;
+  v_new uuid;
+  v_added int;
+begin
+  perform 1 from public.ledgers where id = v_id for update;
+  if (select count(*) from public.recurring where ledger_id = v_id) >= 20 then
+    raise exception '每个账本最多 20 个周期账单' using errcode = '54000';
+  end if;
+  if p_start_on is null or p_start_on < public._bj_today() - 366 or p_start_on > public._bj_today() + 366 then
+    raise exception '首次日期需在前后一年内' using errcode = '22023';
+  end if;
+  -- 与记一笔相同的校验；_check_entry 的日期检查（不晚于明天）对未来的首次日期不适用，这里传今天代替
+  select * into v_chk from public._check_entry(v_id, 'expense', p_amount, p_payer, p_participants,
+    least(p_start_on, public._bj_today()), p_split_mode, p_shares, null);
+  insert into public.recurring (ledger_id, title, amount, payer_id, participant_ids, split_mode, shares, day_of_month, next_on)
+  values (v_id, v_title, p_amount, p_payer, v_chk.o_parts, coalesce(p_split_mode, 'equal'), v_chk.o_shares,
+          extract(day from p_start_on)::int, p_start_on)
+  returning id into v_new;
+  perform public._log(v_id, 'add_recurring', jsonb_build_object('title', v_title, 'amount', p_amount, 'day', extract(day from p_start_on)::int));
+  v_added := public._run_recurring(v_id);
+  return json_build_object('id', v_new, 'added', v_added);
+end $$;
+
+-- 删除周期账单：只停止以后的自动记账，已经记下的流水保留
+create or replace function public.delete_recurring(p_token text, p_recurring uuid)
+returns void language plpgsql volatile security definer set search_path = '' as $$
+declare
+  v_id uuid := public._ledger_id(p_token);
+  v_r record;
+begin
+  perform 1 from public.ledgers where id = v_id for update;
+  delete from public.recurring where id = p_recurring and ledger_id = v_id returning title, amount into v_r;
+  if not found then
+    raise exception '周期账单不存在' using errcode = 'P0002';
+  end if;
+  perform public._log(v_id, 'delete_recurring', jsonb_build_object('title', v_r.title, 'amount', v_r.amount));
+end $$;
+
+-- 打开账本时调用：补记到期的周期账单，返回新记的笔数。没有到期的账单时不加锁、直接返回 0
+create or replace function public.run_recurring(p_token text)
+returns int language plpgsql volatile security definer set search_path = '' as $$
+declare v_id uuid := public._ledger_id(p_token);
+begin
+  if not exists (select 1 from public.recurring where ledger_id = v_id and next_on <= public._bj_today()) then
+    return 0;
+  end if;
+  perform 1 from public.ledgers where id = v_id for update;
+  return public._run_recurring(v_id);
 end $$;
 
 -- 删除 = 移入回收站（软删除）。顺带清理：超过 30 天的、超出 100 条的已删除记录才真正删掉
@@ -420,10 +549,16 @@ begin
   perform public._log(v_id, 'restore_entry', jsonb_build_object('kind', v_e.kind, 'title', v_e.title, 'amount', v_e.amount));
 end $$;
 
--- 权限：内部函数不对外；只开放 10 个 RPC
+-- 权限：内部函数不对外；只开放 13 个 RPC
 revoke all on function public._clean(text, int, text) from public, anon, authenticated;
 revoke all on function public._ledger_id(text) from public, anon, authenticated;
 revoke all on function public._log(uuid, text, jsonb) from public, anon, authenticated;
+revoke all on function public._bj_today() from public, anon, authenticated;
+revoke all on function public._next_month_day(date, int) from public, anon, authenticated;
+revoke all on function public._run_recurring(uuid) from public, anon, authenticated;
+revoke all on function public.add_recurring(text, text, bigint, uuid, uuid[], date, text, bigint[]) from public, anon, authenticated;
+revoke all on function public.delete_recurring(text, uuid) from public, anon, authenticated;
+revoke all on function public.run_recurring(text) from public, anon, authenticated;
 revoke all on function public._check_entry(uuid, text, bigint, uuid, uuid[], date, text, bigint[], uuid[]) from public, anon, authenticated;
 revoke all on function public.create_ledger(text, text[]) from public, anon, authenticated;
 revoke all on function public.get_ledger(text) from public, anon, authenticated;
@@ -438,6 +573,9 @@ revoke all on function public.leave_member(text, uuid) from public, anon, authen
 grant execute on function public.create_ledger(text, text[]) to anon, authenticated;
 grant execute on function public.get_ledger(text) to anon, authenticated;
 grant execute on function public.get_history(text) to anon, authenticated;
+grant execute on function public.add_recurring(text, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
+grant execute on function public.delete_recurring(text, uuid) to anon, authenticated;
+grant execute on function public.run_recurring(text) to anon, authenticated;
 grant execute on function public.restore_entry(text, uuid) to anon, authenticated;
 grant execute on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
 grant execute on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
