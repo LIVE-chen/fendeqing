@@ -1,6 +1,6 @@
 // 数据层：配置了 Supabase 就走云端 RPC；否则退回浏览器 localStorage（仅本机可见，便于离线演示）
 import { CONFIG } from './config.js';
-import { bjToday, dueDates } from './settle.js';
+import { bjToday, dueDates, fxToCents, MAX_AMOUNT_CENTS } from './settle.js';
 
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 export const isCloud = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey);
@@ -37,6 +37,9 @@ async function rpc(fn, args) {
   return data;
 }
 
+// 人民币支出不传外币参数：数据库尚未迁移时人民币记账仍然可用
+const fxArgs = (e) => (e.currency ? { p_currency: e.currency, p_orig_amount: e.origAmount, p_fx_rate: e.fxRate } : {});
+
 const cloud = {
   createLedger: (name, members) => rpc('create_ledger', { p_name: name, p_members: members }),
   getLedger: (token) => rpc('get_ledger', { p_token: token }),
@@ -45,11 +48,13 @@ const cloud = {
     p_payer: e.payerId, p_participants: e.participantIds, p_spent_on: e.spentOn,
     // 均摊时不传新参数：数据库尚未迁移时，最常用的均摊记账仍然可用
     ...(e.splitMode && e.splitMode !== 'equal' ? { p_split_mode: e.splitMode, p_shares: e.shares } : {}),
+    ...fxArgs(e),
   }),
   updateEntry: (token, id, e) => rpc('update_entry', {
     p_token: token, p_entry: id, p_title: e.title, p_amount: e.amount,
     p_payer: e.payerId, p_participants: e.participantIds, p_spent_on: e.spentOn,
     p_split_mode: e.splitMode ?? 'equal', p_shares: e.splitMode && e.splitMode !== 'equal' ? e.shares : null,
+    ...fxArgs(e),
   }),
   deleteEntry: (token, id) => rpc('delete_entry', { p_token: token, p_entry: id }),
   restoreEntry: (token, id) => rpc('restore_entry', { p_token: token, p_entry: id }),
@@ -152,11 +157,12 @@ const local = {
     const d = readLocal(token);
     if (d.entries.length >= 2000) throw new StoreError('单个账本最多 2000 条记录');
     if (e.kind === 'expense') checkActive(d, e, []);
+    e = { ...e, ...fxLocal(e) };
     const id = uuid();
     const splitMode = e.splitMode ?? 'equal';
     d.entries.unshift({ id, ...e, splitMode, shares: splitMode === 'equal' ? null : e.shares, createdAt: now() });
     d.entries.sort(byDate);
-    log(d, 'add_entry', { kind: e.kind, title: e.title, amount: e.amount });
+    log(d, 'add_entry', { kind: e.kind, title: e.title, amount: e.amount, ...(e.currency ? { currency: e.currency, origAmount: e.origAmount } : {}) });
     writeLocal(token, d);
     return id;
   },
@@ -188,11 +194,13 @@ const local = {
     if (!old) throw new StoreError('记录不存在');
     if (old.kind !== 'expense') throw new StoreError('还款记录不能编辑，可以删除后重新标记');
     checkActive(d, e, [...old.participantIds, old.payerId]);
+    e = { ...e, ...fxLocal({ ...e, kind: 'expense' }) };
     const splitMode = e.splitMode ?? 'equal';
     log(d, 'update_entry', { title: e.title, amount: e.amount, oldTitle: old.title, oldAmount: old.amount });
     Object.assign(old, {
       title: e.title, amount: e.amount, payerId: e.payerId, participantIds: e.participantIds, spentOn: e.spentOn,
       splitMode, shares: splitMode === 'equal' ? null : e.shares, updatedAt: now(),
+      currency: e.currency, origAmount: e.origAmount, fxRate: e.fxRate,
     });
     d.entries.sort(byDate);
     writeLocal(token, d);
@@ -232,6 +240,19 @@ const local = {
     writeLocal(token, d);
   },
 };
+
+/** 外币折算（与服务端 _fx_amount 一致）：返回 { amount, currency, origAmount, fxRate }，人民币时三项为 null */
+function fxLocal(e) {
+  if (!e.currency) return { amount: e.amount, currency: null, origAmount: null, fxRate: null };
+  if (e.kind !== 'expense') throw new StoreError('还款只支持人民币');
+  if (!/^[A-Z]{3}$/.test(e.currency) || e.currency === 'CNY') throw new StoreError('币种不合法');
+  if (!(e.origAmount >= 1 && e.origAmount <= 1e12)) throw new StoreError('外币金额需大于 0 且不超过 100 亿');
+  if (!(e.fxRate >= 1 && e.fxRate <= 1e9)) throw new StoreError('汇率需大于 0 且不超过 1000');
+  if (e.splitMode === 'amount') throw new StoreError('外币支出请用均摊或按比例');
+  const amount = fxToCents(e.origAmount, e.fxRate);
+  if (amount < 1 || amount > MAX_AMOUNT_CENTS) throw new StoreError('金额需大于 0 且不超过 1000 万');
+  return { amount, currency: e.currency, origAmount: e.origAmount, fxRate: e.fxRate };
+}
 
 /** 支出不能涉及已退出成员（extra 中的除外：编辑时保留原记录里的人） */
 function checkActive(d, e, extra) {

@@ -103,3 +103,14 @@ test('exportFileName 去掉非法字符', () => {
   assert.equal(exportFileName('502/合租:<A>', '2026-10-20'), '502_合租__A_-2026-10-20.xlsx');
   assert.equal(exportFileName('', '2026-10-20'), '账本-2026-10-20.xlsx');
 });
+
+test('ledgerSheets：外币支出导出原币金额与汇率', () => {
+  const fx = { id: 'fx', kind: 'expense', title: '寿司', amount: 14437, payerId: M[0].id, participantIds: [M[0].id, M[1].id],
+    spentOn: '2026-10-06', createdAt: 'z', splitMode: 'equal', currency: 'JPY', origAmount: 300000, fxRate: 48123 };
+  const [flow] = ledgerSheets({ members: M, entries: [...E, fx] });
+  assert.deepEqual(flow.rows[0].slice(-2), ['原币金额', '汇率']);
+  const row = flow.rows.find((r) => r[2] === '寿司');
+  assert.deepEqual([row[3], row[8], row[9]], [{ money: 14437 }, 'JPY 3,000.00', '0.048123']);
+  assert.deepEqual(flow.rows[1].slice(-2), ['', '']);
+  assert.equal(flow.widths.length, flow.rows[0].length);
+});

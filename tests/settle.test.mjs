@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName, describeActivity, nextMonthDay, bjToday, dueDates } from '../site/js/settle.js';
+import { parseAmount, formatCents, splitEqual, splitByWeights, entryShares, parseSplit, computeBalances, minimizeTransfers, validateMembers, centsToInput, canLeave, validateMemberName, describeActivity, nextMonthDay, bjToday, dueDates, parseForeign, parseRate, rateToInput, fxToCents, formatForeign, currencyName } from '../site/js/settle.js';
 
 test('parseAmount 接受合法金额', () => {
   assert.equal(parseAmount('12'), 1200);
@@ -217,4 +217,31 @@ test('dueDates：列出到期期数并给出下一期', () => {
   assert.deepEqual(dueDates('2026-08-31', 31, '2026-10-20'), { dates: ['2026-08-31', '2026-09-30'], nextOn: '2026-10-31' });
   assert.deepEqual(dueDates('2026-11-01', 1, '2026-10-20'), { dates: [], nextOn: '2026-11-01' });
   assert.deepEqual(dueDates('2026-01-05', 5, '2026-10-20', 2), { dates: ['2026-01-05', '2026-02-05'], nextOn: '2026-03-05' });
+});
+
+test('多币种：外币金额、汇率解析与回填', () => {
+  assert.equal(parseForeign('3000'), 300000);
+  assert.equal(parseForeign('12.5'), 1250);
+  assert.equal(parseForeign('1,234.56'), 123456);
+  for (const bad of ['', '0', '0.00', '-1', '1.234', 'abc', '100000000000']) assert.equal(parseForeign(bad), null, bad);
+  assert.equal(parseRate('0.048123'), 48123);
+  assert.equal(parseRate('7.1'), 7100000);
+  assert.equal(parseRate('1000'), 1000000000);
+  for (const bad of ['', '0', '0.0000001', '1000.000001', '-1', '1e3', '7,1']) assert.equal(parseRate(bad), null, bad);
+  for (const r of [1, 48123, 7100000, 1000000000, 123456789]) assert.equal(parseRate(rateToInput(r)), r);
+  assert.equal(rateToInput(7100000), '7.1');
+  assert.equal(rateToInput(1000000), '1');
+});
+
+test('多币种：折算四舍五入与数据库一致，大数不丢精度', () => {
+  assert.equal(fxToCents(300000, 48123), 14437); // 144.369 元
+  assert.equal(fxToCents(1000, 7123456), 7123);
+  assert.equal(fxToCents(1, 500000), 1); // 0.5 分进位
+  assert.equal(fxToCents(1, 499999), 0);
+  assert.equal(fxToCents(1_000_000_000_000, 1_000_000_000), 1e15); // 乘积 1e21 > 2^53
+  assert.equal(formatForeign(300000, 'JPY'), 'JPY 3,000.00');
+  assert.equal(currencyName('USD'), '美元');
+  assert.equal(currencyName('XYZ'), 'XYZ');
+  assert.equal(describeActivity({ action: 'add_entry', detail: { kind: 'expense', title: '寿司', amount: 14437, currency: 'JPY', origAmount: 300000 } }),
+    '记一笔「寿司」¥144.37（JPY 3,000.00）');
 });

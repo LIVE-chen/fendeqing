@@ -86,6 +86,19 @@ alter table public.recurring enable row level security;
 revoke all on public.recurring from public, anon, authenticated;
 -- 由周期账单生成的流水；删除周期账单后保留流水，只断开关联
 alter table public.entries add column if not exists recurring_id uuid references public.recurring(id) on delete set null;
+-- 多币种（#13）：外币支出另存原币金额（单位为该币种的 1/100）与汇率（1 外币 = fx_rate / 1000000 人民币）。
+-- amount 始终是折合后的人民币分，由服务端按原币金额 × 汇率四舍五入算出；余额与结算只看 amount。
+alter table public.entries add column if not exists currency text;
+alter table public.entries add column if not exists orig_amount bigint;
+alter table public.entries add column if not exists fx_rate bigint;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'entries_fx_chk') then
+    alter table public.entries add constraint entries_fx_chk check (
+      (currency is null and orig_amount is null and fx_rate is null)
+      or (currency ~ '^[A-Z]{3}$' and currency <> 'CNY' and orig_amount between 1 and 1000000000000
+          and fx_rate between 1 and 1000000000));
+  end if;
+end $$;
 create index if not exists entries_ledger_idx on public.entries (ledger_id, created_at desc);
 create index if not exists members_ledger_idx on public.members (ledger_id, position);
 
@@ -230,7 +243,8 @@ begin
     'entries', coalesce((select json_agg(json_build_object(
                   'id', id, 'kind', kind, 'title', title, 'amount', amount, 'payerId', payer_id,
                   'participantIds', participant_ids, 'spentOn', spent_on, 'createdAt', created_at,
-                  'splitMode', split_mode, 'shares', shares, 'updatedAt', updated_at, 'recurringId', recurring_id)
+                  'splitMode', split_mode, 'shares', shares, 'updatedAt', updated_at, 'recurringId', recurring_id,
+                  'currency', currency, 'origAmount', orig_amount, 'fxRate', fx_rate)
                   order by spent_on desc, created_at desc)
                  from public.entries where ledger_id = v_id and deleted_at is null), '[]'::json),
     'recurring', coalesce((select json_agg(json_build_object(
@@ -251,7 +265,8 @@ begin
   return json_build_object(
     'deleted', coalesce((select json_agg(json_build_object(
                   'id', id, 'kind', kind, 'title', title, 'amount', amount, 'payerId', payer_id,
-                  'participantIds', participant_ids, 'spentOn', spent_on, 'deletedAt', deleted_at) order by deleted_at desc, id)
+                  'participantIds', participant_ids, 'spentOn', spent_on, 'deletedAt', deleted_at,
+                  'currency', currency, 'origAmount', orig_amount) order by deleted_at desc, id)
                  from (select * from public.entries where ledger_id = v_id and deleted_at is not null
                         order by deleted_at desc, id limit 100) d), '[]'::json),
     'activities', coalesce((select json_agg(json_build_object('at', at, 'action', action, 'detail', detail) order by id desc)
@@ -320,18 +335,49 @@ begin
   end if;
 end $$;
 
--- 旧版 7 参数签名：新增分摊参数后先删掉，避免出现重载。
--- 新签名的两个参数带默认值，已缓存的旧前端按原参数调用仍然可用。
+-- 内部：外币支出折合人民币（#13）。三个外币参数都为空时原样返回 p_amount（人民币支出）。
+-- 外币时忽略 p_amount，按 原币金额 × 汇率 / 1000000 四舍五入，避免前后端算法不一致导致余额对不上。
+create or replace function public._fx_amount(
+  p_kind text, p_amount bigint, p_currency text, p_orig bigint, p_rate bigint, p_split_mode text
+) returns bigint language plpgsql immutable set search_path = '' as $$
+begin
+  if p_currency is null and p_orig is null and p_rate is null then
+    return p_amount;
+  end if;
+  if p_kind is distinct from 'expense' then
+    raise exception '还款只支持人民币' using errcode = '22023';
+  end if;
+  if p_currency is null or p_currency !~ '^[A-Z]{3}$' or p_currency = 'CNY' then
+    raise exception '币种不合法' using errcode = '22023';
+  end if;
+  if p_orig is null or p_orig < 1 or p_orig > 1000000000000 then
+    raise exception '外币金额需大于 0 且不超过 100 亿' using errcode = '22023';
+  end if;
+  if p_rate is null or p_rate < 1 or p_rate > 1000000000 then
+    raise exception '汇率需大于 0 且不超过 1000' using errcode = '22023';
+  end if;
+  if coalesce(p_split_mode, 'equal') = 'amount' then
+    raise exception '外币支出请用均摊或按比例' using errcode = '22023';
+  end if;
+  return round(p_orig::numeric * p_rate / 1000000)::bigint;
+end $$;
+
+-- 旧版签名：每次新增参数后先删掉，避免出现重载。
+-- 新参数都带默认值，已缓存的旧前端按原参数调用仍然可用。
 drop function if exists public.add_entry(text, text, text, bigint, uuid, uuid[], date);
+drop function if exists public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[]);
+drop function if exists public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[]);
 
 create or replace function public.add_entry(
   p_token text, p_kind text, p_title text, p_amount bigint,
   p_payer uuid, p_participants uuid[], p_spent_on date,
-  p_split_mode text default 'equal', p_shares bigint[] default null
+  p_split_mode text default 'equal', p_shares bigint[] default null,
+  p_currency text default null, p_orig_amount bigint default null, p_fx_rate bigint default null
 ) returns uuid language plpgsql volatile security definer set search_path = '' as $$
 declare
   v_id uuid := public._ledger_id(p_token);
   v_title text := public._clean(p_title, 40, '内容');
+  v_amount bigint := public._fx_amount(p_kind, p_amount, p_currency, p_orig_amount, p_fx_rate, p_split_mode);
   v_chk record;
   v_new uuid;
 begin
@@ -340,11 +386,14 @@ begin
   if (select count(*) from public.entries where ledger_id = v_id and deleted_at is null) >= 2000 then
     raise exception '单个账本最多 2000 条记录' using errcode = '54000';
   end if;
-  select * into v_chk from public._check_entry(v_id, p_kind, p_amount, p_payer, p_participants, p_spent_on, p_split_mode, p_shares, null);
-  insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids, spent_on, split_mode, shares)
-  values (v_id, p_kind, v_title, p_amount, p_payer, v_chk.o_parts, p_spent_on, coalesce(p_split_mode, 'equal'), v_chk.o_shares)
+  select * into v_chk from public._check_entry(v_id, p_kind, v_amount, p_payer, p_participants, p_spent_on, p_split_mode, p_shares, null);
+  insert into public.entries (ledger_id, kind, title, amount, payer_id, participant_ids, spent_on, split_mode, shares,
+                              currency, orig_amount, fx_rate)
+  values (v_id, p_kind, v_title, v_amount, p_payer, v_chk.o_parts, p_spent_on, coalesce(p_split_mode, 'equal'), v_chk.o_shares,
+          p_currency, p_orig_amount, p_fx_rate)
   returning id into v_new;
-  perform public._log(v_id, 'add_entry', jsonb_build_object('kind', p_kind, 'title', v_title, 'amount', p_amount));
+  perform public._log(v_id, 'add_entry', jsonb_build_object('kind', p_kind, 'title', v_title, 'amount', v_amount)
+    || case when p_currency is null then '{}'::jsonb else jsonb_build_object('currency', p_currency, 'origAmount', p_orig_amount) end);
   return v_new;
 end $$;
 
@@ -352,11 +401,13 @@ end $$;
 create or replace function public.update_entry(
   p_token text, p_entry uuid, p_title text, p_amount bigint,
   p_payer uuid, p_participants uuid[], p_spent_on date,
-  p_split_mode text default 'equal', p_shares bigint[] default null
+  p_split_mode text default 'equal', p_shares bigint[] default null,
+  p_currency text default null, p_orig_amount bigint default null, p_fx_rate bigint default null
 ) returns void language plpgsql volatile security definer set search_path = '' as $$
 declare
   v_id uuid := public._ledger_id(p_token);
   v_title text := public._clean(p_title, 40, '内容');
+  v_amount bigint := public._fx_amount('expense', p_amount, p_currency, p_orig_amount, p_fx_rate, p_split_mode);
   v_old record;
   v_chk record;
 begin
@@ -369,14 +420,16 @@ begin
   if v_old.kind <> 'expense' then
     raise exception '还款记录不能编辑，可以删除后重新标记' using errcode = '22023';
   end if;
-  select * into v_chk from public._check_entry(v_id, 'expense', p_amount, p_payer, p_participants, p_spent_on, p_split_mode, p_shares,
+  select * into v_chk from public._check_entry(v_id, 'expense', v_amount, p_payer, p_participants, p_spent_on, p_split_mode, p_shares,
                                v_old.participant_ids || v_old.payer_id);
+  -- 不传外币参数即改为人民币支出（前端编辑时总是带上当前币种）
   update public.entries
-     set title = v_title, amount = p_amount, payer_id = p_payer, participant_ids = v_chk.o_parts,
-         spent_on = p_spent_on, split_mode = coalesce(p_split_mode, 'equal'), shares = v_chk.o_shares, updated_at = now()
+     set title = v_title, amount = v_amount, payer_id = p_payer, participant_ids = v_chk.o_parts,
+         spent_on = p_spent_on, split_mode = coalesce(p_split_mode, 'equal'), shares = v_chk.o_shares, updated_at = now(),
+         currency = p_currency, orig_amount = p_orig_amount, fx_rate = p_fx_rate
    where id = p_entry;
   perform public._log(v_id, 'update_entry', jsonb_build_object(
-    'title', v_title, 'amount', p_amount, 'oldTitle', v_old.title, 'oldAmount', v_old.amount));
+    'title', v_title, 'amount', v_amount, 'oldTitle', v_old.title, 'oldAmount', v_old.amount));
 end $$;
 
 -- 添加成员；名字与已退出成员相同时恢复该成员
@@ -556,6 +609,7 @@ revoke all on function public._log(uuid, text, jsonb) from public, anon, authent
 revoke all on function public._bj_today() from public, anon, authenticated;
 revoke all on function public._next_month_day(date, int) from public, anon, authenticated;
 revoke all on function public._run_recurring(uuid) from public, anon, authenticated;
+revoke all on function public._fx_amount(text, bigint, text, bigint, bigint, text) from public, anon, authenticated;
 revoke all on function public.add_recurring(text, text, bigint, uuid, uuid[], date, text, bigint[]) from public, anon, authenticated;
 revoke all on function public.delete_recurring(text, uuid) from public, anon, authenticated;
 revoke all on function public.run_recurring(text) from public, anon, authenticated;
@@ -564,8 +618,8 @@ revoke all on function public.create_ledger(text, text[]) from public, anon, aut
 revoke all on function public.get_ledger(text) from public, anon, authenticated;
 revoke all on function public.get_history(text) from public, anon, authenticated;
 revoke all on function public.restore_entry(text, uuid) from public, anon, authenticated;
-revoke all on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[]) from public, anon, authenticated;
-revoke all on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[]) from public, anon, authenticated;
+revoke all on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[], text, bigint, bigint) from public, anon, authenticated;
+revoke all on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[], text, bigint, bigint) from public, anon, authenticated;
 revoke all on function public.delete_entry(text, uuid) from public, anon, authenticated;
 revoke all on function public.add_member(text, text) from public, anon, authenticated;
 revoke all on function public.rename_member(text, uuid, text) from public, anon, authenticated;
@@ -577,8 +631,8 @@ grant execute on function public.add_recurring(text, text, bigint, uuid, uuid[],
 grant execute on function public.delete_recurring(text, uuid) to anon, authenticated;
 grant execute on function public.run_recurring(text) to anon, authenticated;
 grant execute on function public.restore_entry(text, uuid) to anon, authenticated;
-grant execute on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
-grant execute on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[]) to anon, authenticated;
+grant execute on function public.add_entry(text, text, text, bigint, uuid, uuid[], date, text, bigint[], text, bigint, bigint) to anon, authenticated;
+grant execute on function public.update_entry(text, uuid, text, bigint, uuid, uuid[], date, text, bigint[], text, bigint, bigint) to anon, authenticated;
 grant execute on function public.delete_entry(text, uuid) to anon, authenticated;
 grant execute on function public.add_member(text, text) to anon, authenticated;
 grant execute on function public.rename_member(text, uuid, text) to anon, authenticated;

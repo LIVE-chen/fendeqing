@@ -177,7 +177,8 @@ export function validateMembers(names) {
 const ACTION_TEXT = {
   create: (d) => `创建账本「${d.name}」，成员：${(d.members ?? []).join('、')}`,
   add_entry: (d) => (d.kind === 'transfer' ? `记录还款 ${formatCents(d.amount)}`
-    : `${d.recurring ? '自动记入周期账单' : '记一笔'}「${d.title}」${formatCents(d.amount)}`),
+    : `${d.recurring ? '自动记入周期账单' : '记一笔'}「${d.title}」${formatCents(d.amount)}`
+      + (d.currency ? `（${formatForeign(d.origAmount, d.currency)}）` : '')),
   update_entry: (d) => {
     const parts = [];
     if (d.oldTitle !== d.title) parts.push(`「${d.oldTitle}」→「${d.title}」`);
@@ -225,4 +226,50 @@ export function dueDates(nextOn, dom, today, max = Infinity) {
   let d = nextOn;
   while (d <= today && dates.length < max) { dates.push(d); d = nextMonthDay(d, dom); }
   return { dates, nextOn: d };
+}
+
+// ---------- 多币种（#13）：汇率由用户填写，不调用第三方汇率服务 ----------
+// 原币金额统一以该币种的 1/100 为单位（日元、韩元也一样，最多两位小数）；
+// 汇率以百万分之一为单位：1 外币 = rate / 1000000 人民币。折算规则与数据库 _fx_amount 一致。
+export const CURRENCIES = [
+  ['CNY', '人民币'], ['USD', '美元'], ['EUR', '欧元'], ['JPY', '日元'], ['KRW', '韩元'], ['HKD', '港币'],
+  ['MOP', '澳门元'], ['TWD', '新台币'], ['GBP', '英镑'], ['THB', '泰铢'], ['SGD', '新加坡元'], ['AUD', '澳元'],
+  ['MYR', '林吉特'], ['VND', '越南盾'],
+];
+export const currencyName = (code) => CURRENCIES.find(([c]) => c === code)?.[1] ?? code;
+export const MAX_FOREIGN = 1_000_000_000_000; // 原币最多 100 亿
+export const MAX_RATE = 1_000_000_000; // 汇率最多 1000
+
+/** 外币金额 "3000" / "12.5" → 1/100 单位；非法返回 null */
+export function parseForeign(input) {
+  const s = String(input ?? '').trim().replace(/,/g, '');
+  if (!/^\d{1,11}(\.\d{1,2})?$/.test(s)) return null;
+  const [a, f = ''] = s.split('.');
+  const v = Number(a) * 100 + Number((f + '00').slice(0, 2));
+  return v >= 1 && v <= MAX_FOREIGN ? v : null;
+}
+
+/** 汇率 "0.048123" → 48123（最多 6 位小数，大于 0 且不超过 1000）；非法返回 null */
+export function parseRate(input) {
+  const s = String(input ?? '').trim();
+  if (!/^\d{1,4}(\.\d{1,6})?$/.test(s)) return null;
+  const [a, f = ''] = s.split('.');
+  const v = Number(a) * 1_000_000 + Number((f + '000000').slice(0, 6));
+  return v >= 1 && v <= MAX_RATE ? v : null;
+}
+
+/** 48123 → "0.048123"；7100000 → "7.1"（编辑时回填） */
+export function rateToInput(rate) {
+  const f = String(rate % 1_000_000).padStart(6, '0').replace(/0+$/, '');
+  return `${Math.floor(rate / 1_000_000)}${f ? '.' + f : ''}`;
+}
+
+/** 原币 × 汇率 → 人民币分，四舍五入。用 BigInt：乘积可达 10^21，超过 2^53 */
+export function fxToCents(orig, rate) {
+  return Number((BigInt(orig) * BigInt(rate) + 500_000n) / 1_000_000n);
+}
+
+/** "JPY 3,000.00" */
+export function formatForeign(orig, code) {
+  return `${code} ${Math.floor(orig / 100).toLocaleString('zh-CN')}.${String(orig % 100).padStart(2, '0')}`;
 }

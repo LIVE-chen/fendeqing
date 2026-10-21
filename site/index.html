@@ -26,9 +26,20 @@
       <label>内容
         <input name="title" maxlength="40" required placeholder="例如：10 月电费" autocomplete="off" />
       </label>
-      <label>金额（元）
-        <input name="amount" inputmode="decimal" required placeholder="0.00" autocomplete="off" />
-      </label>
+      <div class="amount-row">
+        <label class="amount-field"><span id="amount-label">金额（元）</span>
+          <input name="amount" inputmode="decimal" required placeholder="0.00" autocomplete="off" />
+        </label>
+        <label class="currency-field">币种
+          <select name="currency" id="currency"></select>
+        </label>
+      </div>
+      <div id="fx-row" hidden>
+        <label><span id="rate-label">汇率</span>
+          <input name="fxRate" inputmode="decimal" placeholder="例如 0.048" autocomplete="off" aria-describedby="fx-preview" />
+        </label>
+        <p class="hint" id="fx-preview" aria-live="polite">汇率请自己填写（可参考银行或支付软件的当日汇率），本应用不联网查询。</p>
+      </div>
       <label>谁付的
         <select name="payer" required></select>
       </label>

@@ -428,8 +428,48 @@ ok(await page.locator('.entries li', { hasText: '房租' }).count() === expectN 
 await page.getByRole('button', { name: '删除周期账单 视频会员' }).click();
 await page.waitForFunction(() => !document.querySelector('#recurring'));
 ok(true, '没有周期账单时不显示卡片');
+// #13 多币种：手填汇率，按折合人民币计入余额
+const balBefore = await page.textContent('#balances');
+await page.click('.fab');
+await page.fill('input[name=title]', '大阪寿司');
+await page.selectOption('#currency', 'JPY');
+ok(await page.isVisible('#fx-row') && (await page.textContent('#amount-label')).includes('日元'), '选外币后显示汇率输入，金额标签变为日元');
+ok(await page.locator('input[name=splitMode][value=amount]').isDisabled() && await page.locator('#repeat').isDisabled(), '外币支出不能按金额分摊、不能设为每月重复');
+await page.fill('input[name=amount]', '4000');
+await page.click('#entry-submit');
+ok((await page.textContent('#entry-error')).includes('请填写汇率'), '没填汇率时提示');
+await page.fill('input[name=fxRate]', '0.048123');
+ok((await page.textContent('#fx-preview')).includes('JPY 4,000.00 ≈ ¥192.49'), '实时显示折合人民币');
+for (const i of [1, 2, 3]) await page.locator('input[name=participant]').nth(i).uncheck(); // 只留第一个人和……
+await page.locator('input[name=participant]').nth(1).check(); // 我 + 小王
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await busyDone();
+const sushi = page.locator('.entries li', { hasText: '大阪寿司' });
+ok((await sushi.textContent()).includes('¥192.49') && (await sushi.textContent()).includes('JPY 4,000.00'), '流水同时显示折合人民币和原币金额');
+ok(await page.textContent('#balances') !== balBefore, '外币支出按折合金额计入余额');
+// 编辑：回填原币与汇率；再记一笔同币种时预填上次的汇率
+await page.getByRole('button', { name: '编辑 大阪寿司' }).click();
+ok(await page.inputValue('#currency') === 'JPY' && await page.inputValue('input[name=amount]') === '4000.00'
+  && await page.inputValue('input[name=fxRate]') === '0.048123', '编辑外币支出：币种、原币金额、汇率已回填');
+await page.fill('input[name=fxRate]', '0.05');
+await page.click('#entry-submit');
+await page.locator('#entry-dialog').waitFor({ state: 'hidden', timeout: 15000 });
+await busyDone();
+ok((await sushi.textContent()).includes('¥200.00'), '修改汇率后重新折算');
+await page.click('.fab');
+ok(await page.inputValue('#currency') === 'CNY' && await page.isHidden('#fx-row'), '新记一笔默认人民币');
+await page.selectOption('#currency', 'JPY');
+ok(await page.inputValue('input[name=fxRate]') === '0.05', '同币种预填本账本上次的汇率');
+await page.fill('input[name=title]', '便利店');
+await page.fill('input[name=amount]', '1200');
+await hideToast();
+await page.screenshot({ path: shots + '12-currency.png' });
+await page.keyboard.press('Escape');
+
 await page.click('#open-history');
 await page.waitForSelector('#history-log li:has-text("新建周期账单")');
+ok((await page.textContent('#history-log')).includes('JPY 4,000.00'), '操作记录里显示原币金额');
 ok((await page.textContent('#history-log')).includes('自动记入周期账单「房租」'), '操作记录里能看到自动记账');
 await page.click('#history-close');
 
