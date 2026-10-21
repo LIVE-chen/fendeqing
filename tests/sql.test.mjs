@@ -464,3 +464,50 @@ test('周期账单：账本满 2000 条时暂停补记，腾出空间后继续�
   await rejects(asAnon(`select public._run_recurring(gen_random_uuid())`), /permission denied/);
   await rejects(asAnon(`select public._bj_today()`), /permission denied/);
 });
+
+// ---------- #13 多币种 ----------
+test('多币种：服务端按原币 × 汇率折算人民币，编辑可改币种，校验与日志', async () => {
+  const { t, ids, get } = await ledgerWith(['a', 'b', 'c'], '60.0.0.1');
+  const addFx = (orig, cur, rate, mode = 'equal', shares = null, kind = 'expense', parts = ids) =>
+    asAnon(`select public.add_entry($1,$2,'寿司',999,$3,$4::uuid[],current_date,$5,$6::bigint[],$7,$8,$9) e`,
+      [t, kind, ids[0], parts, mode, shares, cur, orig, rate]).then((r) => r.rows[0].e);
+  // 3,000 日元，汇率 0.048123 → 144.369 元 → 14437 分（忽略前端传来的 999）
+  const e = await addFx(300000, 'JPY', 48123);
+  let l = await get();
+  let x = l.entries.find((y) => y.id === e);
+  assert.deepEqual([x.amount, x.currency, x.origAmount, x.fxRate], [14437, 'JPY', 300000, 48123]);
+  await addFx(1000, 'USD', 7123456, 'ratio', [2, 1, 1]); // 10 美元 → 71.23456 → 7123 分
+  l = await get();
+  assert.equal(l.entries.find((y) => y.currency === 'USD').amount, 7123);
+  // 校验
+  await rejects(addFx(100, 'CNY', 1000000), /币种不合法/);
+  await rejects(addFx(100, 'usd', 1000000), /币种不合法/);
+  await rejects(addFx(0, 'USD', 1000000), /外币金额/);
+  await rejects(addFx(100, 'USD', 0), /汇率/);
+  await rejects(addFx(100, 'USD', 1000000001), /汇率/);
+  await rejects(addFx(100, 'USD', null), /汇率/);
+  await rejects(addFx(1000, 'USD', 1000000, 'amount', [5, 5]), /均摊或按比例/);
+  await rejects(addFx(100, 'USD', 1000000, 'equal', null, 'transfer', [ids[1]]), /还款只支持人民币/);
+  await rejects(addFx(1000000000000, 'USD', 1000000000), /金额需大于 0 且不超过 1000 万/); // 折合后超上限
+  // 折合后不足 1 分
+  await rejects(addFx(1, 'IDR', 1), /金额需大于 0/);
+  // 编辑：改汇率，再改回人民币
+  await asAnon(`select public.update_entry($1,$2,'寿司',1,$3,$4::uuid[],current_date,'equal',null,'JPY',300000,50000)`, [t, e, ids[0], ids]);
+  x = (await get()).entries.find((y) => y.id === e);
+  assert.equal(x.amount, 15000);
+  await asAnon(`select public.update_entry($1,$2,'寿司',12000,$3,$4::uuid[],current_date)`, [t, e, ids[0], ids]);
+  x = (await get()).entries.find((y) => y.id === e);
+  assert.deepEqual([x.amount, x.currency, x.origAmount, x.fxRate], [12000, null, null, null]);
+  // 日志记录原币；回收站返回原币
+  const acts = (await history(t)).activities;
+  assert.deepEqual(acts.find((a) => a.detail.currency === 'USD').detail, { kind: 'expense', title: '寿司', amount: 7123, currency: 'USD', origAmount: 1000 });
+  const usd = (await get()).entries.find((y) => y.currency === 'USD');
+  await asAnon('select public.delete_entry($1,$2)', [t, usd.id]);
+  const del = (await history(t)).deleted[0];
+  assert.deepEqual([del.currency, del.origAmount], ['USD', 1000]);
+  // 旧前端：9 参数调用仍可用；内部函数 anon 不可调
+  await asAnon(`select public.add_entry($1,'expense','旧',100,$2,$3::uuid[],current_date,'equal',null)`, [t, ids[0], ids]);
+  await rejects(asAnon(`select public._fx_amount('expense',1,'USD',1,1,'equal')`), /permission denied/);
+  const { rows } = await db.query(`select count(*)::int n from pg_proc where proname in ('add_entry','update_entry')`);
+  assert.equal(rows[0].n, 2, '没有残留的旧重载');
+});

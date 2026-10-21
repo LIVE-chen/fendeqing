@@ -54,6 +54,10 @@ fieldset { border: 0; padding: 0; margin: 12px 0 0; }
 .check-row { display: flex; align-items: center; gap: 8px; min-height: 44px; margin: 8px 0 0; color: var(--text); cursor: pointer; }
 .check-row input { width: 20px; height: 20px; min-height: 0; margin: 0; flex: none; accent-color: var(--brand); }
 #repeat-hint:empty { display: none; }
+.amount-row { display: grid; grid-template-columns: 1fr 8.5em; gap: 10px; align-items: end; }
+.amount-row label { margin-bottom: 0; }
+.fx-orig { display: block; font-weight: 400; text-align: right; white-space: nowrap; }
+.segmented label:has(input:disabled) { opacity: .45; cursor: not-allowed; }
 legend { font-size: 14px; color: var(--muted); padding: 0; display: flex; gap: 12px; align-items: center; }
 
 .btn {

@@ -1,6 +1,7 @@
 import {
   parseAmount, formatCents, computeBalances, minimizeTransfers, parseSplit, entryShares,
   centsToInput, canLeave, isActive, validateMemberName, describeActivity, dueDates,
+  CURRENCIES, currencyName, parseForeign, parseRate, rateToInput, fxToCents, formatForeign, MAX_AMOUNT_CENTS,
 } from './settle.js';
 import { monthlyTotals, memberStats, barPercents, ledgerSheets, exportFileName } from './stats.js';
 import { buildXlsx } from './xlsx.js';
@@ -112,7 +113,8 @@ function paint(root) {
           return h('li', {},
             isT ? h('div', { class: 'entry-main' }, body)
               : h('button', { type: 'button', class: 'entry-main entry-edit', 'aria-label': `编辑 ${e.title}`, onclick: () => openEntryDialog(root, e) }, body),
-            h('span', { class: 'amount' }, formatCents(e.amount)),
+            h('span', { class: 'amount' }, formatCents(e.amount),
+              e.currency ? h('span', { class: 'muted small fx-orig' }, formatForeign(e.origAmount, e.currency)) : null),
             h('button', { class: 'icon-btn', 'aria-label': `删除 ${e.title}`, onclick: (ev) => removeEntry(root, ev.currentTarget, e) }, '×'));
         })));
 
@@ -278,10 +280,13 @@ function openEntryDialog(root, entry = null) {
     h('label', { class: 'chip' }, h('input', { type: 'checkbox', name: 'participant', value: m.id, checked: checked.has(m.id) }), label(m))));
   shareInputs.replaceChildren();
   $('#repeat-row').hidden = Boolean(entry); // 只有新记一笔时可以设为每月重复
+  form.elements.currency.value = entry?.currency ?? 'CNY';
+  updateCurrency({ fillRate: false });
+  if (entry?.currency) form.elements.fxRate.value = rateToInput(entry.fxRate);
   updateRepeat();
   if (entry) {
     form.elements.title.value = entry.title;
-    form.elements.amount.value = centsToInput(entry.amount);
+    form.elements.amount.value = entry.currency ? centsToInput(entry.origAmount) : centsToInput(entry.amount);
     form.elements.payer.value = entry.payerId;
     form.elements.spentOn.value = entry.spentOn;
     const mode = entry.splitMode === 'ratio' || entry.splitMode === 'amount' ? entry.splitMode : 'equal';
@@ -329,7 +334,8 @@ function renderShareInputs({ keep = true } = {}) {
 /** 实时提示：按比例时显示每人折算金额；按金额时显示与总额的差 */
 function updatePreview() {
   const mode = splitMode();
-  const amount = parseAmount(form.elements.amount.value);
+  const { amount } = readAmount();
+  updateFxPreview();
   const ids = checkedIds();
   errEl.textContent = ''; // 用户已在修改，旧的提交报错不再准确
   preview.classList.remove('warn');
@@ -364,6 +370,55 @@ const dueCount = (d, dom) => dueDates(d, dom, state.today, 13).dates.length;
 repeatBox.addEventListener('change', updateRepeat);
 form.elements.spentOn.addEventListener('input', updateRepeat);
 
+// ---------- 币种（#13）：汇率由用户填写，余额与结算一律按折合后的人民币计算 ----------
+const curSel = form.elements.currency;
+curSel.replaceChildren(...CURRENCIES.map(([c, name]) => h('option', { value: c }, c === 'CNY' ? '人民币' : `${name} ${c}`)));
+const fxPreview = $('#fx-preview');
+const FX_HINT = '汇率请自己填写（可参考银行或支付软件的当日汇率），本应用不联网查询。';
+const isForeign = () => curSel.value !== 'CNY';
+
+/** 读取金额：人民币直接解析；外币按 原币 × 汇率 折算。返回 { amount, fx, error } */
+function readAmount() {
+  if (!isForeign()) {
+    const amount = parseAmount(form.elements.amount.value);
+    return amount == null ? { error: '金额格式不对，最多两位小数，且大于 0、不超过 1000 万' } : { amount, fx: null };
+  }
+  const orig = parseForeign(form.elements.amount.value);
+  if (orig == null) return { error: '外币金额格式不对，最多两位小数，且大于 0' };
+  const rate = parseRate(form.elements.fxRate.value);
+  if (rate == null) return { error: '请填写汇率：大于 0、不超过 1000，最多 6 位小数' };
+  const amount = fxToCents(orig, rate);
+  if (amount < 1 || amount > MAX_AMOUNT_CENTS) return { error: '折合人民币需大于 0 且不超过 1000 万' };
+  return { amount, fx: { currency: curSel.value, origAmount: orig, fxRate: rate } };
+}
+
+function updateFxPreview() {
+  if (!isForeign()) return;
+  const r = readAmount();
+  fxPreview.textContent = r.fx ? `${formatForeign(r.fx.origAmount, r.fx.currency)} ≈ ${formatCents(r.amount)}（1 ${r.fx.currency} = ${rateToInput(r.fx.fxRate)} 元）` : FX_HINT;
+}
+
+/** 切换币种：外币时显示汇率，不支持按金额分摊和每月重复；fillRate 时用本账本最近一次该币种的汇率预填 */
+function updateCurrency({ fillRate = true } = {}) {
+  const foreign = isForeign();
+  $('#fx-row').hidden = !foreign;
+  $('#amount-label').textContent = foreign ? `金额（${currencyName(curSel.value)}）` : '金额（元）';
+  $('#rate-label').textContent = foreign ? `汇率：1 ${curSel.value} = ? 元` : '汇率';
+  const amountRadio = form.querySelector('input[name=splitMode][value=amount]');
+  amountRadio.disabled = foreign;
+  if (foreign && amountRadio.checked) { form.querySelector('input[name=splitMode][value=equal]').checked = true; renderShareInputs({ keep: false }); }
+  if (foreign) { repeatBox.checked = false; updateRepeat(); }
+  repeatBox.disabled = foreign;
+  if (fillRate) {
+    const last = state.entries.find((e) => e.currency === curSel.value);
+    form.elements.fxRate.value = last ? rateToInput(last.fxRate) : '';
+  }
+  fxPreview.textContent = FX_HINT;
+  updatePreview();
+}
+curSel.addEventListener('change', () => updateCurrency());
+form.elements.fxRate.addEventListener('input', updatePreview);
+
 $('#split-mode').addEventListener('change', () => renderShareInputs({ keep: false }));
 $('#participants').addEventListener('change', () => renderShareInputs());
 shareInputs.addEventListener('input', updatePreview);
@@ -389,12 +444,12 @@ form.addEventListener('submit', (ev) => {
   ev.preventDefault();
   errEl.textContent = '';
   const title = form.elements.title.value.trim();
-  const amount = parseAmount(form.elements.amount.value);
+  const { amount, fx, error: amountErr } = readAmount();
   const payerId = form.elements.payer.value;
   const participantIds = [...form.querySelectorAll('input[name=participant]:checked')].map((b) => b.value);
   const spentOn = form.elements.spentOn.value;
   if (!title) return void (errEl.textContent = '请填写内容');
-  if (amount == null) return void (errEl.textContent = '金额格式不对，最多两位小数，且大于 0、不超过 1000 万');
+  if (amountErr) return void (errEl.textContent = amountErr);
   if (participantIds.length === 0) return void (errEl.textContent = '至少选择一位分摊成员');
   const mode = splitMode();
   const split = parseSplit(mode, amount, shareValues(participantIds));
@@ -408,7 +463,7 @@ form.addEventListener('submit', (ev) => {
 
   withBusy($('#entry-submit'), async () => {
     try {
-      const e = { kind: 'expense', title, amount, payerId, participantIds, spentOn, splitMode: mode, shares: split.shares };
+      const e = { kind: 'expense', title, amount, payerId, participantIds, spentOn, splitMode: mode, shares: split.shares, ...fx };
       let msg;
       if (repeat) {
         const { added } = await store.addRecurring(state.token, { ...e, startOn: spentOn });
@@ -418,7 +473,7 @@ form.addEventListener('submit', (ev) => {
         msg = '已保存修改';
       } else {
         await store.addEntry(state.token, e);
-        msg = `已记录 ${formatCents(amount)}`;
+        msg = fx ? `已记录 ${formatForeign(fx.origAmount, fx.currency)}，折合 ${formatCents(amount)}` : `已记录 ${formatCents(amount)}`;
       }
       dialog.close();
       toast(msg);
@@ -564,7 +619,8 @@ async function loadHistory() {
       h('div', { class: 'entry-main' },
         h('div', { class: 'entry-title' }, e.kind === 'transfer' ? h('span', { class: 'tag' }, '还款') : null, e.title),
         h('div', { class: 'muted small' }, `${e.spentOn} · ${nameOf(e.payerId)} ${e.kind === 'transfer' ? '还款' : '付款'} · 删除于 ${fmtTime(e.deletedAt)}`)),
-      h('span', { class: 'amount' }, formatCents(e.amount)),
+      h('span', { class: 'amount' }, formatCents(e.amount),
+        e.currency ? h('span', { class: 'muted small fx-orig' }, formatForeign(e.origAmount, e.currency)) : null),
       h('button', {
         type: 'button', class: 'btn small', 'aria-label': `恢复 ${e.title}`,
         onclick: (ev) => withBusy(ev.currentTarget, async () => { if (await restoreEntry(hRoot, e.id)) await loadHistory(); }),

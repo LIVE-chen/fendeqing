@@ -1,5 +1,5 @@
 // 纯函数：统计（只算支出，不算还款）。金额单位为分。
-import { entryShares, computeBalances, minimizeTransfers } from './settle.js';
+import { entryShares, computeBalances, minimizeTransfers, formatForeign, rateToInput } from './settle.js';
 
 /** 按月汇总支出：[{ month: '2026-10', total, count }]，按月份倒序 */
 export function monthlyTotals(entries) {
@@ -45,7 +45,7 @@ export function ledgerSheets({ members, entries }) {
     const m = members.find((x) => x.id === id);
     return m ? m.name + (m.left ? '（已退出）' : '') : '已删除成员';
   };
-  const flow = [['日期', '类型', '内容', '金额（元）', '付款人', '分摊方式', '分摊明细', '已编辑']];
+  const flow = [['日期', '类型', '内容', '金额（元）', '付款人', '分摊方式', '分摊明细', '已编辑', '原币金额', '汇率']];
   for (const e of [...entries].sort((a, b) => a.spentOn.localeCompare(b.spentOn) || String(a.createdAt).localeCompare(String(b.createdAt)))) {
     const isT = e.kind === 'transfer';
     flow.push([
@@ -54,6 +54,9 @@ export function ledgerSheets({ members, entries }) {
       isT ? `还给 ${nameOf(e.participantIds[0])}`
         : entryShares(members, e).map(([id, c]) => `${nameOf(id)} ${(c / 100).toFixed(2)}`).join('，'),
       e.updatedAt ? '是' : '',
+      // 外币支出另列原币与汇率（文本），金额列始终是折合后的人民币
+      e.currency ? formatForeign(e.origAmount, e.currency) : '',
+      e.currency ? rateToInput(e.fxRate) : '',
     ]);
   }
   const balances = computeBalances(members, entries);
@@ -69,7 +72,7 @@ export function ledgerSheets({ members, entries }) {
   const monthly = [['月份', '支出笔数', '支出合计（元）']];
   for (const m of monthlyTotals(entries)) monthly.push([m.month, m.count, { money: m.total }]);
   return [
-    { name: '流水', rows: flow, widths: [12, 6, 24, 12, 12, 9, 40, 7] },
+    { name: '流水', rows: flow, widths: [12, 6, 24, 12, 12, 9, 40, 7, 18, 11] },
     { name: '每人余额', rows: bal, widths: [16, 15, 15, 12, 8] },
     { name: '结算方案', rows: plan, widths: [16, 16, 12] },
     { name: '按月统计', rows: monthly, widths: [10, 10, 15] },
