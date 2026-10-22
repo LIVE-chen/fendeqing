@@ -64,6 +64,7 @@ await inputs.nth(2).fill('小李');
 await page.click('text=创建账本');
 await page.waitForSelector('.ledger-head');
 ok(/#\/l\/[0-9a-f]{32}$/.test(page.url()), '创建账本后跳转到带 128bit token 的链接');
+ok(!/\bnull\b|\bundefined\b/.test(await page.textContent('#app')), '新账本页无 null/undefined 文本');
 const hideToast = () => page.evaluate(() => { document.querySelector('#toast').hidden = true; });
 
 async function addExpense(title, amount, payerIdx, uncheck = []) {
@@ -428,6 +429,7 @@ ok(await page.locator('.entries li', { hasText: '房租' }).count() === expectN 
 await page.getByRole('button', { name: '删除周期账单 视频会员' }).click();
 await page.waitForFunction(() => !document.querySelector('#recurring'));
 ok(true, '没有周期账单时不显示卡片');
+ok(!/\bnull\b|\bundefined\b/.test(await page.textContent('#app')), '账本页无 null/undefined 文本');
 // #13 多币种：手填汇率，按折合人民币计入余额
 const balBefore = await page.textContent('#balances');
 await page.click('.fab');

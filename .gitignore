@@ -1,3 +1,6 @@
 # Local Netlify folder
 .netlify
 node_modules/
+
+# 交付物（视频等大文件不进仓库）
+deliverables/
