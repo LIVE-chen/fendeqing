@@ -119,7 +119,7 @@ function paint(root) {
         })));
 
   const fab = h('button', { class: 'fab', onclick: () => openEntryDialog(root) }, '+ 记一笔');
-  root.replaceChildren(header, settle, balanceList, recurringCard(root), statsCard(), entryList, fab);
+  root.replaceChildren(...[header, settle, balanceList, recurringCard(root), statsCard(), entryList, fab].filter(Boolean));
 }
 
 // ---------- 周期账单 ----------
